@@ -6,13 +6,41 @@
   const DEFAULT_BUNDLED_PDF_PATH = "./PBHCL%20(4).pdf"
   const DEFAULT_BUNDLED_PDF_NAME = "PBHCL (4).pdf"
   const DEFAULT_VISION_MODEL = "gpt-4.1"
+  const HELP_SPEC_LOADING_INTERVAL_MS = 4200
   const HELP_SPEC_LOADING_LINES = [
     "Analyzing details... good specs take a beat.",
-    "Reading the page cluster, not just the page you clicked.",
+    "Reading the relevant pages, not just the one you clicked.",
     "Sorting dimensions, finishes, upholstery, and pricing into something human.",
     "Architects love clean lines. PDFs do not always cooperate.",
     "COM means Customer's Own Material. COL means Customer's Own Leather.",
-    "Cross-checking continuation pages so one finish table does not hijack the whole product."
+    "Cross-checking reference pages so one finish table does not hijack the whole result.",
+    "Looking for the exact product before it looks for the exact finish.",
+    "Separating family-level pages from variant-level details.",
+    "Comparing headers, pricing tables, and dimensions across candidate pages.",
+    "Checking whether this page is one product, several products, or a family overview.",
+    "Trying not to let marketing photography win the argument over the spec table.",
+    "Matching finishes, materials, and dimensions to the right context.",
+    "Pulling structure out of a layout that definitely did not volunteer it.",
+    "Scanning for clues in titles, captions, tables, and tiny labels.",
+    "Figuring out which pages are shared references versus product-specific pages.",
+    "Looking for the point where options become actual spec decisions.",
+    "Keeping the useful pages and ignoring the decorative detours.",
+    "Turning price-list chaos into tabs you can actually use.",
+    "Checking whether a nearby page is a continuation, a sibling variant, or neither.",
+    "Separating configuration choices from finish choices.",
+    "Making sure dimensions stay attached to the right variant.",
+    "Trying to keep one powder coat legend from becoming the answer to everything.",
+    "Looking for repeated family names, model cues, and variant language.",
+    "Reducing the odds that one ambiguous SKU sends the whole result sideways.",
+    "Searching for the pages that matter after the click, not just next to it.",
+    "Comparing shared spec pages against variant-specific pages.",
+    "Finding where the actual specification content begins.",
+    "Checking if the page is broad enough to require a selector first.",
+    "Grouping together pages that describe the same family context.",
+    "Making the PDF admit what should have been structured data.",
+    "Reading the page like a spec editor, not like a thumbnail strip.",
+    "Trying to preserve exact units, fractions, and notation while sorting content.",
+    "Looking for the details that change the spec, not just the details that fill the page."
   ]
 
   const sampleDocuments = buildSampleDocuments()
@@ -82,7 +110,11 @@
     sourceSelectionChosenId: "",
     decisionAssistLoading: false,
     helpSpecLoadingLineIndex: 0,
+    helpSpecLoadingLineOrder: [],
     decisionAssistResult: null,
+    familyPageProductsByKey: {},
+    familyPageProductsStatusByKey: {},
+    familyPageProductsErrorByKey: {},
     activeDecisionChoiceIndex: -1,
     decisionTabsWindowStart: 0,
     decisionAssistError: "",
@@ -118,19 +150,41 @@
   }
 
   function getHelpSpecLoadingLine() {
-    return HELP_SPEC_LOADING_LINES[appState.helpSpecLoadingLineIndex % HELP_SPEC_LOADING_LINES.length]
+    const lineOrder = Array.isArray(appState.helpSpecLoadingLineOrder) ? appState.helpSpecLoadingLineOrder : []
+    const activeIndex = lineOrder[appState.helpSpecLoadingLineIndex]
+    return HELP_SPEC_LOADING_LINES[activeIndex] || HELP_SPEC_LOADING_LINES[0]
+  }
+
+  function buildHelpSpecLoadingLineOrder() {
+    const order = HELP_SPEC_LOADING_LINES.map((_, index) => index)
+    for (let index = order.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(Math.random() * (index + 1))
+      const current = order[index]
+      order[index] = order[swapIndex]
+      order[swapIndex] = current
+    }
+    return order
   }
 
   function startHelpSpecLoadingTicker() {
     if (helpSpecLoadingIntervalId) return
+    if (!appState.helpSpecLoadingLineOrder.length) {
+      appState.helpSpecLoadingLineOrder = buildHelpSpecLoadingLineOrder()
+    }
     helpSpecLoadingIntervalId = window.setInterval(() => {
       if (!appState.decisionAssistLoading) {
         stopHelpSpecLoadingTicker()
         return
       }
-      appState.helpSpecLoadingLineIndex = (appState.helpSpecLoadingLineIndex + 1) % HELP_SPEC_LOADING_LINES.length
+      const nextIndex = appState.helpSpecLoadingLineIndex + 1
+      if (nextIndex >= HELP_SPEC_LOADING_LINES.length) {
+        appState.helpSpecLoadingLineOrder = buildHelpSpecLoadingLineOrder()
+        appState.helpSpecLoadingLineIndex = 0
+      } else {
+        appState.helpSpecLoadingLineIndex = nextIndex
+      }
       renderPreservingViewerScroll()
-    }, 1800)
+    }, HELP_SPEC_LOADING_INTERVAL_MS)
   }
 
   function stopHelpSpecLoadingTicker() {
@@ -245,6 +299,7 @@
   function getConfigurationMatrix(characteristic) {
     const matrix = characteristic?.pricing_matrix || characteristic?.pricingMatrix || null
     if (!matrix) return null
+    const rowLabel = formatConfigurationDisplayLabel(matrix?.row_label || matrix?.rowLabel || "")
     const columns = Array.isArray(matrix?.column_labels)
       ? matrix.column_labels.map((item) => formatConfigurationDisplayLabel(item)).filter(Boolean)
       : Array.isArray(matrix?.columnLabels)
@@ -264,7 +319,50 @@
       })).filter((row) => row.name)
       : []
     if (!columns.length || !rows.length) return null
-    return { columns, rows }
+    return { rowLabel, columns, rows }
+  }
+
+  function isFinishOrShellDescriptor(value) {
+    const normalized = normalizeText(value).toLowerCase()
+    if (!normalized) return false
+    return /finish|veneer|chrome|walnut|ash|oak|ebony|palisander|stain|black base|chrome base|shell|nonupholstered|upholstered/.test(normalized)
+  }
+
+  function shouldHideConfigurationCharacteristic(characteristic, selectedVariantId, characteristics) {
+    if (!/configuration/i.test(normalizeText(characteristic?.label || ""))) return false
+
+    const hasShellFinish = hasCharacteristicLabel(characteristics, /shell finish|wood finish/i)
+    const hasBaseFrameFinish = hasCharacteristicLabel(characteristics, /base finish|frame finish|base \/ frame finish/i)
+    if (!hasShellFinish && !hasBaseFrameFinish) return false
+
+    const sections = getConfigurationSections(characteristic)
+    const options = getCharacteristicOptions(characteristic)
+    const matrix = getConfigurationMatrix(characteristic)
+
+    const hasMeaningfulSections = sections.some((section) => {
+      if (!section.options.length) return false
+      if (isFinishOrShellDescriptor(section.title)) return false
+      return section.options.some((option) => !isFinishOrShellDescriptor(option))
+    })
+
+    const hasMeaningfulOptions = options.some((option) => !isFinishOrShellDescriptor(option.name) && !isGenericConfigurationOptionName(option.name))
+
+    const hasMeaningfulMatrix = Boolean(
+      matrix
+      && !isFinishOrShellDescriptor(matrix.rowLabel)
+      && matrix.rows.some((row) => !isFinishOrShellDescriptor(row.name))
+      && matrix.columns.some((column) => !isFinishOrShellDescriptor(column))
+      && matrix.rows.some((row) => row.cells.some((cell) => normalizeText(cell.price)))
+    )
+
+    const onlyGenericShellStub = !hasMeaningfulSections && !hasMeaningfulOptions && !hasMeaningfulMatrix
+    if (selectedVariantId && onlyGenericShellStub) return true
+    return onlyGenericShellStub
+  }
+
+  function pruneResolvedConfigurationCharacteristics(characteristics, selectedVariantId) {
+    const items = Array.isArray(characteristics) ? characteristics : []
+    return items.filter((characteristic) => !shouldHideConfigurationCharacteristic(characteristic, selectedVariantId, items))
   }
 
   function getCharacteristicOptions(characteristic) {
@@ -354,7 +452,210 @@
     if (!pageNumbers?.length) return ""
     const sorted = [...new Set(pageNumbers)].sort((a, b) => a - b)
     if (sorted.length === 1) return String(sorted[0])
-    return `${sorted[0]}-${sorted[sorted.length - 1]}`
+    const segments = []
+    let rangeStart = sorted[0]
+    let previous = sorted[0]
+
+    for (let index = 1; index <= sorted.length; index += 1) {
+      const current = sorted[index]
+      const isBreak = current !== previous + 1
+      if (isBreak) {
+        segments.push(rangeStart === previous ? String(rangeStart) : `${rangeStart}-${previous}`)
+        rangeStart = current
+      }
+      previous = current
+    }
+
+    return segments.join(", ")
+  }
+
+  function detectFamilyPdfArchetype(documentRecord = null) {
+    const documentToCheck = documentRecord || getActiveDocument()
+    if (!documentToCheck?.pages?.length) return false
+
+    const samplePages = documentToCheck.pages.slice(0, 16)
+    let familySignals = 0
+
+    samplePages.forEach((page) => {
+      const text = normalizeText(getPageCombinedText(page))
+      if (!text) return
+      const lowered = text.toLowerCase()
+      const modelMatches = text.match(/\b[A-Z]{1,4}-\d{1,3}[A-Z0-9-]*\b/g) || []
+      if (modelMatches.length >= 2) familySignals += 2
+      if (/item\s+description/i.test(text) && /list price/i.test(text)) familySignals += 2
+      if (/series\b/i.test(text) && /low back|high back|wire base|wood base|pedestal/i.test(lowered)) familySignals += 1
+      if (/required to specify|metal finish|veneer finish|shell finish/i.test(lowered)) familySignals += 1
+    })
+
+    return familySignals >= 4
+  }
+
+  function getSpecParsingMode() {
+    const brand = normalizeText(appState.spec.brandDisplayName || appState.spec.originalBrand || "").toLowerCase()
+    if (/\bdavis\b/.test(brand)) return "family"
+    if (detectFamilyPdfArchetype()) return "family"
+    return "contiguous"
+  }
+
+  function getSpecParsingModeConfig(modeOverride = "") {
+    const mode = normalizeText(modeOverride) || getSpecParsingMode()
+    if (mode === "family") {
+      return {
+        mode,
+        label: "family",
+        scopeNoun: "family",
+        pageLabel: "family-relevant",
+        selectorProductTitle: "Select the product in this family",
+        selectorProductCopy: "This Davis page appears to contain more than one distinct product within the same family. Choose the product first, then the system will gather the shared spec and reference pages tied to that family context.",
+        selectorVariantTitle: "Select the variant to review",
+        selectorVariantCopy: "This Davis page appears to contain multiple related variants in the same family. Pick the variant first, then the system will gather the family-level spec and reference pages that apply to it."
+      }
+    }
+
+    return {
+      mode,
+      label: "contiguous product",
+      scopeNoun: "product",
+      pageLabel: "contiguous",
+      selectorProductTitle: "Select the product on this page",
+      selectorProductCopy: "This starting page appears to contain more than one product. Choose the one you want, then the system will scan forward until the next page is no longer the same product.",
+      selectorVariantTitle: "Select the variant to review",
+      selectorVariantCopy: "This starting page appears to contain more than one variant for the same product. Pick the one you want before the spec characteristics are shown."
+    }
+  }
+
+  function getFamilyResultPageLimit() {
+    return 8
+  }
+
+  function getAiRerankCandidateLimit() {
+    return getSpecParsingMode() === "family" ? 12 : 5
+  }
+
+  function getAiKeptPageLimit() {
+    return getSpecParsingMode() === "family" ? 8 : 3
+  }
+
+  function buildFamilySearchTokens(documentRecord, selectedPage) {
+    const productName = normalizeText(appState.spec.specDisplayName || appState.spec.originalSpecName || "")
+    const selectedTitle = normalizeText(getPrimaryHeaderTitle(documentRecord, selectedPage.pageNumber))
+    const selectedText = normalizeText(getPageCombinedText(selectedPage)).slice(0, 500)
+    const variantStopwords = new Set([
+      "wire",
+      "wood",
+      "base",
+      "pedestal",
+      "prong",
+      "low",
+      "high",
+      "back",
+      "footrest",
+      "exposed",
+      "veneer",
+      "shell",
+      "fully",
+      "upholstered",
+      "contrasting",
+      "material"
+    ])
+    const genericStopwords = new Set([
+      "the",
+      "and",
+      "for",
+      "with",
+      "from",
+      "this",
+      "that",
+      "price",
+      "list",
+      "pages",
+      "page",
+      "spec",
+      "specs",
+      "specification",
+      "specifications",
+      "reference",
+      "references",
+      "finish",
+      "finishes",
+      "powder",
+      "coat",
+      "davis"
+    ])
+
+    return [...new Set(
+      `${productName} ${selectedTitle} ${selectedText}`
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((token) => token.length >= 3)
+        .filter((token) => !genericStopwords.has(token))
+        .filter((token) => !variantStopwords.has(token))
+    )].slice(0, 8)
+  }
+
+  function getFamilyDecisionCandidatePages(documentRecord, selectedPage, selectionHints = {}) {
+    const selectedProductHint = normalizeText(selectionHints.selectedProductId || "")
+    const selectedVariantHint = normalizeText(selectionHints.selectedVariantId || "")
+    const allowFamilyExpansion = selectionHints.allowFamilyExpansion === true
+    if (!selectedProductHint && !selectedVariantHint) {
+      return selectedPage ? [selectedPage] : []
+    }
+    if (!allowFamilyExpansion) {
+      return selectedPage ? [selectedPage] : []
+    }
+
+    const familyTokens = buildFamilySearchTokens(documentRecord, selectedPage)
+    const selectedTitle = normalizeText(getPrimaryHeaderTitle(documentRecord, selectedPage.pageNumber)).toLowerCase()
+    const exactProduct = normalizeText(appState.spec.specDisplayName || appState.spec.originalSpecName || "").toLowerCase()
+    const rankedScoreByPage = new Map(appState.rankedPages.map((page) => [page.pageNumber, Number(page.score) || 0]))
+    const referencePattern = /finish|finishes|powder\s*coat|specification|specifications|dimension|dimensions|material|upholstery|veneer|glide|pricing|price list|reference/i
+    const variantPattern = /wire base|wood base|four prong pedestal|low back|high back|footrest|exposed veneer shell|fully upholstered|contrasting material/i
+
+    const scoredPages = documentRecord.pages
+      .map((page) => {
+        const pageTitle = normalizeText(getPrimaryHeaderTitle(documentRecord, page.pageNumber))
+        const pageText = normalizeText(getPageCombinedText(page))
+        const haystack = `${pageTitle}\n${pageText}`.toLowerCase()
+        const tokenMatches = familyTokens.filter((token) => haystack.includes(token))
+        const titleTokenMatches = familyTokens.filter((token) => pageTitle.toLowerCase().includes(token))
+        const hasReferenceSignals = referencePattern.test(pageTitle) || referencePattern.test(pageText)
+        const hasVariantSignals = variantPattern.test(haystack)
+        let score = page.pageNumber === selectedPage.pageNumber ? 200 : 0
+
+        if (exactProduct && haystack.includes(exactProduct)) score += 40
+        score += tokenMatches.length * 8
+        score += titleTokenMatches.length * 6
+        score += Math.min(24, Math.round((rankedScoreByPage.get(page.pageNumber) || 0) / 2))
+        if (selectedTitle && pageTitle && pageTitle.toLowerCase().includes(selectedTitle)) score += 18
+        if (tokenMatches.length && hasReferenceSignals) score += 14
+        if (hasVariantSignals) score += 8
+
+        return {
+          page,
+          score
+        }
+      })
+      .filter((entry) => entry.score >= 14 || entry.page.pageNumber === selectedPage.pageNumber)
+      .sort((a, b) => b.score - a.score || a.page.pageNumber - b.page.pageNumber)
+
+    const topPages = scoredPages.slice(0, 10).map((entry) => entry.page)
+    if (topPages.length > 1) {
+      return [...topPages].sort((a, b) => a.pageNumber - b.pageNumber)
+    }
+
+    return documentRecord.pages
+      .filter((page) => page.pageNumber >= selectedPage.pageNumber)
+      .slice(0, 4)
+  }
+
+  function getDecisionCandidatePages(documentRecord, selectedPage, selectionHints = {}) {
+    if (getSpecParsingMode() === "family") {
+      return getFamilyDecisionCandidatePages(documentRecord, selectedPage, selectionHints)
+    }
+
+    return documentRecord.pages
+      .filter((page) => page.pageNumber >= selectedPage.pageNumber)
+      .slice(0, 6)
   }
 
   function normalizeDecisionCandidates(items) {
@@ -385,6 +686,134 @@
       return !referencedPages.length || referencedPages.includes(startPageNumber)
     })
     return startPageCandidates.length ? startPageCandidates : candidates
+  }
+
+  function buildVariantEvidenceTokens(label) {
+    const genericTokens = new Set([
+      "ginkgo",
+      "ply",
+      "lounge",
+      "chair",
+      "chairs",
+      "seating",
+      "base",
+      "model",
+      "series",
+      "davis"
+    ])
+
+    return tokenize(label)
+      .filter((token) => token.length >= 4 || token === "wood" || token === "wire")
+      .filter((token) => !genericTokens.has(token))
+  }
+
+  function extractConcreteVariantCandidatesFromPageText(pageText, subtypeHint = "") {
+    const rawText = String(pageText || "")
+    const modelPattern = /\b([A-Z]{1,4}-\d{1,3}[A-Z0-9-]*)\b/g
+    const itemMatches = [...rawText.matchAll(modelPattern)]
+    if (itemMatches.length < 2) return []
+
+    const phraseMatchers = [
+      { pattern: /exposed veneer shell/gi, label: "Exposed Veneer Shell" },
+      { pattern: /interior upholstery/gi, label: "Interior Upholstery" },
+      { pattern: /fully upholstered/gi, label: "Fully Upholstered" },
+      { pattern: /all same material/gi, label: "All Same Material" },
+      { pattern: /contrasting material/gi, label: "Contrasting Material" },
+      { pattern: /wire base/gi, label: "Wire Base" },
+      { pattern: /wood base/gi, label: "Wood Base" },
+      { pattern: /four prong pedestal/gi, label: "Four Prong Pedestal" },
+      { pattern: /memory return swivel/gi, label: "Memory Return Swivel" },
+      { pattern: /swivel/gi, label: "Swivel" },
+      { pattern: /fixed/gi, label: "Fixed" },
+      { pattern: /low back/gi, label: "Low Back" },
+      { pattern: /high back/gi, label: "High Back" }
+    ]
+
+    const items = itemMatches.map((match, index) => {
+      const model = normalizeText(match[1] || "")
+      const start = match.index || 0
+      const end = itemMatches[index + 1]?.index || rawText.length
+      const block = rawText.slice(start, end)
+      const matchedLabels = phraseMatchers
+        .filter((entry) => entry.pattern.test(block))
+        .map((entry) => entry.label)
+
+      return {
+        model,
+        block,
+        matchedLabels: [...new Set(matchedLabels)]
+      }
+    })
+
+    const labelFrequency = new Map()
+    items.forEach((item) => {
+      item.matchedLabels.forEach((label) => {
+        labelFrequency.set(label, (labelFrequency.get(label) || 0) + 1)
+      })
+    })
+
+    return items.map((item, index) => {
+      const distinctiveLabels = item.matchedLabels.filter((label) => (labelFrequency.get(label) || 0) < items.length)
+      const preferredLabels = distinctiveLabels.filter((label) => !/low back|high back|wire base|wood base|four prong pedestal|fixed|swivel/i.test(label))
+      const labelParts = (preferredLabels.length ? preferredLabels : distinctiveLabels.length ? distinctiveLabels : item.matchedLabels).slice(0, 3)
+      const label = labelParts.join(" / ")
+      return {
+        id: slugify(`${item.model}-${label || `variant-${index + 1}`}`, `variant-${index + 1}`),
+        label: label || `Model ${item.model}`,
+        description: item.model,
+        evidence: `Page-local model ${item.model}`,
+        matchedLabels: item.matchedLabels
+      }
+    })
+      .filter((candidate) => normalizeText(candidate.label))
+      .filter((candidate) => {
+        const hint = normalizeText(subtypeHint).toLowerCase()
+        if (!hint) return true
+        const candidateText = [candidate.label, ...(candidate.matchedLabels || [])].map((value) => normalizeText(value).toLowerCase()).join(" ")
+        if (/wire base/.test(hint)) return /wire base/.test(candidateText)
+        if (/wood base/.test(hint)) return /wood base/.test(candidateText)
+        if (/memory return/.test(hint)) return /memory return/.test(candidateText)
+        if (/pedestal/.test(hint) && /fixed/.test(hint)) return /four prong pedestal/.test(candidateText) && /\bfixed\b/.test(candidateText)
+        if (/pedestal/.test(hint) && /swivel/.test(hint)) return /four prong pedestal/.test(candidateText) && /\bswivel\b/.test(candidateText)
+        if (/pedestal/.test(hint)) return /four prong pedestal/.test(candidateText)
+        return true
+      })
+      .map(({ matchedLabels, ...candidate }) => candidate)
+  }
+
+  function preferConcretePageVariants(candidates, selectedPage, selectedVariantHint = "", documentRecord = null) {
+    if (getSpecParsingMode() !== "family" || selectedVariantHint) return candidates || []
+    const subtypeHint = getSelectedPageSubtypeHint(documentRecord, selectedPage)
+    const concreteCandidates = extractConcreteVariantCandidatesFromPageText(getPageCombinedText(selectedPage), subtypeHint)
+    if (concreteCandidates.length >= 2) return concreteCandidates
+    if ((String(getPageCombinedText(selectedPage)).match(/\b[A-Z]{1,4}-\d{1,3}[A-Z0-9-]*\b/g) || []).length >= 2) {
+      return []
+    }
+
+    const genericVariantLabels = new Set(["base type", "upholstery type", "material type", "finish type"])
+    const filtered = (candidates || []).filter((candidate) => !genericVariantLabels.has(normalizeText(candidate.label).toLowerCase()))
+    return filtered.length ? filtered : candidates || []
+  }
+
+  function filterVariantCandidatesToSelectedPage(candidates, selectedPage, documentRecord) {
+    if (getSpecParsingMode() !== "family" || !selectedPage) return candidates || []
+    if (!Array.isArray(candidates) || candidates.length <= 1) return candidates || []
+
+    const pageTitle = normalizeText(getPrimaryHeaderTitle(documentRecord, selectedPage.pageNumber)).toLowerCase()
+    const pageText = normalizeText(getPageCombinedText(selectedPage)).toLowerCase()
+    const haystack = `${pageTitle}\n${pageText}`
+
+    const filtered = candidates.filter((candidate) => {
+      const label = normalizeText(candidate.label).toLowerCase()
+      const simplifiedLabel = label.replace(/[(),]/g, " ").replace(/\s+/g, " ").trim()
+      if (simplifiedLabel && haystack.includes(simplifiedLabel)) return true
+
+      const tokens = buildVariantEvidenceTokens(candidate.label)
+      if (!tokens.length) return false
+      return tokens.every((token) => haystack.includes(token))
+    })
+
+    return filtered.length ? filtered : candidates
   }
 
   function filterCandidatesToResolvedProduct(candidates, productName) {
@@ -558,6 +987,16 @@
     return ""
   }
 
+  function isDerivedNonStructuralConfigurationSection(sectionTitle) {
+    return Boolean(mapConfigurationSectionToCharacteristicLabel(sectionTitle))
+  }
+
+  function isGenericConfigurationOptionName(name) {
+    const normalized = normalizeText(name).toLowerCase()
+    if (!normalized) return false
+    return /^(shell|nonupholstered|upholstered|fully upholstered|exposed veneer shell|shell only|side chair shell)$/.test(normalized)
+  }
+
   function splitOvergroupedConfiguration(characteristics) {
     const items = Array.isArray(characteristics) ? [...characteristics] : []
     const derivedCharacteristics = []
@@ -579,6 +1018,7 @@
         if (!rawSections.length) return item
 
         const keptSections = []
+        let derivedSectionCount = 0
         rawSections.forEach((section) => {
           const title = normalizeText(section?.title || section?.name || section?.label || "")
           const mappedLabel = mapConfigurationSectionToCharacteristicLabel(title)
@@ -590,6 +1030,8 @@
             keptSections.push(section)
             return
           }
+
+          derivedSectionCount += 1
 
           if (!normalizedExistingLabels.has(mappedLabel.toLowerCase())) {
             derivedCharacteristics.push({
@@ -610,11 +1052,25 @@
           }
         })
 
-        return {
+        const nextItem = {
           ...item,
           configuration_sections: keptSections
         }
+
+        const optionNames = getCharacteristicOptions(nextItem).map((option) => normalizeText(option.name)).filter(Boolean)
+        const hasStructuralSections = keptSections.some((section) => !isDerivedNonStructuralConfigurationSection(section?.title || section?.name || section?.label || ""))
+        const hasStructuralOptions = optionNames.some((name) => !/finish|veneer|upholstery|fabric|material/i.test(name) && !isGenericConfigurationOptionName(name))
+        const onlyDerivedSectionsRemain = rawSections.length > 0 && derivedSectionCount === rawSections.length && !hasStructuralSections
+        if (!nextItem.pricing_matrix && !nextItem.pricingMatrix && onlyDerivedSectionsRemain && !hasStructuralOptions) {
+          return null
+        }
+        if (!nextItem.pricing_matrix && !nextItem.pricingMatrix && !keptSections.length && optionNames.length > 0 && optionNames.every((name) => isGenericConfigurationOptionName(name))) {
+          return null
+        }
+
+        return nextItem
       })
+      .filter(Boolean)
       .filter((item) => {
         if (!/configuration/i.test(normalizeText(item.label))) return true
         const sections = Array.isArray(item.configuration_sections) ? item.configuration_sections : []
@@ -910,19 +1366,94 @@
       .map((line) => normalizeText(line))
       .filter(Boolean)
 
-    const matchingLine = lines.find((line) => line.toLowerCase().includes(normalizedOption.toLowerCase()))
-    if (!matchingLine) return ""
+    const normalizedSearchTerms = [...new Set([
+      normalizedOption,
+      normalizedOption.replace(/^[A-Z0-9]+\s+/, ""),
+      normalizedOption.replace(/\([^)]*\)/g, ""),
+      normalizedOption.replace(/^[A-Z0-9]+\s+/, "").replace(/\([^)]*\)/g, "")
+    ].map((value) => normalizeText(value)).filter((value) => value.length >= 3))]
+    const codeMatch = normalizedOption.match(/\(([A-Z0-9]{1,4})\)|\b([A-Z0-9]{1,4})$/i)
+    const optionCode = normalizeText(codeMatch?.[1] || codeMatch?.[2] || "").toUpperCase()
+    const plainLabel = normalizedSearchTerms[normalizedSearchTerms.length - 1] || normalizedOption
+    const reversedSearchTerms = optionCode && plainLabel
+      ? [`${optionCode} ${plainLabel}`, `${plainLabel} ${optionCode}`]
+      : []
+    const allSearchTerms = [...new Set([...normalizedSearchTerms, ...reversedSearchTerms].map((value) => normalizeText(value)).filter((value) => value.length >= 2))]
 
-    const dollarMatch = matchingLine.match(/\$[\d,]+(?:\.\d+)?(?:\s*(?:ea|each|list|net))?/i)
-    if (dollarMatch) return dollarMatch[0]
+    const extractPriceFromCandidate = (candidateLine) => {
+      const dollarMatch = candidateLine.match(/[+\-]?\$[\d,]+(?:\.\d+)?(?:\s*(?:ea|each|list|net))?/i)
+      if (dollarMatch) return normalizeText(dollarMatch[0])
 
-    const upchargeMatch = matchingLine.match(/(?:upcharge|add|premium|list price|price)\s*[:\-]?\s*([$+\-]?[\d,]+(?:\.\d+)?(?:\s*(?:ea|each|sq ft))?)/i)
-    if (upchargeMatch) return `${matchingLine.match(/upcharge|add|premium|list price|price/i)?.[0] || "Price"} ${upchargeMatch[1]}`
+      const upchargeMatch = candidateLine.match(/(?:upcharge|add|added|premium|list price|price)\s*[:\-]?\s*([+\-]?\$[\d,]+(?:\.\d+)?(?:\s*(?:ea|each|sq ft))?)/i)
+      if (upchargeMatch) return `${candidateLine.match(/upcharge|add|added|premium|list price|price/i)?.[0] || "Price"} ${normalizeText(upchargeMatch[1])}`
 
-    const textileMatch = matchingLine.match(/\b(?:COM|COL)\b[^.;]*?\b\d+(?:\.\d+)?\s*(?:sq ft|yd|yards?)\b/i)
-    if (textileMatch) return textileMatch[0]
+      const textileMatch = candidateLine.match(/\b(?:COM|COL)\b[^.;]*?\b\d+(?:\.\d+)?\s*(?:sq ft|yd|yards?)\b/i)
+      if (textileMatch) return textileMatch[0]
+
+      return ""
+    }
+
+    const fullText = normalizeText(text)
+    if (fullText) {
+      for (const term of allSearchTerms) {
+        const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        const forwardPattern = new RegExp(`${escapedTerm}[^$+\\-]{0,80}([+\\-]?\\$[\\d,]+(?:\\.\\d+)?)`, "i")
+        const backwardPattern = new RegExp(`([+\\-]?\\$[\\d,]+(?:\\.\\d+)?)[^$+\\-]{0,80}${escapedTerm}`, "i")
+        const forwardMatch = fullText.match(forwardPattern)
+        if (forwardMatch?.[1]) return normalizeText(forwardMatch[1])
+        const backwardMatch = fullText.match(backwardPattern)
+        if (backwardMatch?.[1]) return normalizeText(backwardMatch[1])
+      }
+
+      if (optionCode) {
+        const compactCodePattern = new RegExp(`\\b${optionCode}\\b[^$+\\-]{0,40}([+\\-]?\\$[\\d,]+(?:\\.\\d+)?)`, "i")
+        const compactCodeMatch = fullText.match(compactCodePattern)
+        if (compactCodeMatch?.[1]) return normalizeText(compactCodeMatch[1])
+      }
+    }
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index]
+      const loweredLine = line.toLowerCase()
+      const matchesOption = allSearchTerms.some((term) => loweredLine.includes(term.toLowerCase()))
+      if (!matchesOption) continue
+
+      const candidateLines = [
+        line,
+        lines[index + 1] || "",
+        lines[index + 2] || "",
+        lines[index - 1] || ""
+      ].filter(Boolean)
+
+      for (const candidateLine of candidateLines) {
+        const price = extractPriceFromCandidate(candidateLine)
+        if (price) return price
+      }
+    }
 
     return ""
+  }
+
+  function getCharacteristicSearchTerms(characteristicLabel, optionName) {
+    const normalizedLabel = normalizeText(characteristicLabel)
+    const normalizedOption = normalizeText(optionName)
+    const strippedOption = normalizeText(normalizedOption.replace(/^[A-Z0-9]+\s+/, "").replace(/\([^)]*\)/g, ""))
+    const codeMatch = normalizedOption.match(/\(([A-Z0-9]{1,4})\)|\b([A-Z0-9]{1,4})$/i)
+    const optionCode = normalizeText(codeMatch?.[1] || codeMatch?.[2] || "").toUpperCase()
+    const terms = [normalizedOption, strippedOption]
+
+    if (optionCode && strippedOption) {
+      terms.push(`${optionCode} ${strippedOption}`, `${strippedOption} ${optionCode}`, optionCode)
+    }
+
+    if (/shell finish/i.test(normalizedLabel)) {
+      terms.push(`${normalizedOption} shell finish`, `${strippedOption} shell finish`, `${normalizedOption} veneer`, `${strippedOption} veneer`)
+    }
+    if (/base|frame finish/i.test(normalizedLabel)) {
+      terms.push(`${normalizedOption} base finish`, `${strippedOption} base finish`, `${normalizedOption} frame finish`, `${strippedOption} frame finish`)
+    }
+
+    return [...new Set(terms.map((term) => normalizeText(term)).filter((term) => term.length >= 3))]
   }
 
   function extractDetailedUpholsteryOptionsFromText(text, pageNumber) {
@@ -956,6 +1487,62 @@
     const names = (options || []).map((option) => normalizeText(option.name).toLowerCase())
     if (!names.length) return true
     return names.every((name) => /standard categories|material options|fabric price category|price categories|^com$|^col$/.test(name))
+  }
+
+  function extractSupplementalFinishOptionsFromText(text, pageNumber) {
+    const shellOptions = new Map()
+    const baseFrameOptions = new Map()
+    const lines = String(text || "")
+      .split("\n")
+      .map((line) => normalizeText(line))
+      .filter(Boolean)
+
+    const addOption = (map, name, pricing = "") => {
+      const key = normalizeText(name)
+      if (!key) return
+      map.set(key, {
+        name: key,
+        values: "",
+        pricing: normalizeText(pricing),
+        difference: "",
+        evidence: `Detected on page ${pageNumber}`
+      })
+    }
+
+    lines.forEach((line) => {
+      let match = line.match(/^(?:-)?([A-Z0-9]{1,4})\s+(.+?)\s+([+\-]?\$[\d,]+(?:\.\d+)?)$/i)
+      if (match) {
+        const code = normalizeText(match[1]).toUpperCase()
+        const label = titleCaseWords(match[2])
+        const price = normalizeText(match[3])
+        if (/black|chrome|powder coat|metal/i.test(label)) {
+          addOption(baseFrameOptions, `${label} (${code})`, price)
+          return
+        }
+        addOption(shellOptions, `${label} (${code})`, price)
+        return
+      }
+
+      match = line.match(/^(?:-)?([A-Z0-9]{1,4})\s+(.+)$/i)
+      if (!match) return
+      const code = normalizeText(match[1]).toUpperCase()
+      const label = normalizeText(match[2])
+      if (!label || /^(list price|grades|com\/col|item|description)$/i.test(label)) return
+
+      const pricing = extractOptionPricingFromText(text, `${label} (${code})`) || extractOptionPricingFromText(text, `${code} ${label}`)
+      if (/black|chrome|powder coat|metal/i.test(label)) {
+        addOption(baseFrameOptions, `${titleCaseWords(label)} (${code})`, pricing)
+        return
+      }
+      if (/oak|walnut|ash|ebony|palisander|stain|paint|veneer/i.test(label)) {
+        addOption(shellOptions, `${titleCaseWords(label)} (${code})`, pricing)
+      }
+    })
+
+    return {
+      shellOptions,
+      baseFrameOptions
+    }
   }
 
   function extractConfigurationComboPrices(text) {
@@ -1119,6 +1706,27 @@
         }
       }
 
+      if (/shell finish|frame finish|base finish|wood finish|finish/i.test(normalizedLabel)) {
+        const enrichedOptions = item.options.map((option) => {
+          if (normalizeText(option.pricing)) return option
+          const pricing = (sectionPages || [])
+            .map((page) => {
+              const pageText = getPageCombinedText(page)
+              const searchTerms = getCharacteristicSearchTerms(item.label, option.name)
+              return searchTerms
+                .map((term) => extractOptionPricingFromText(pageText, term))
+                .find(Boolean) || ""
+            })
+            .find(Boolean)
+          return pricing ? { ...option, pricing } : option
+        })
+
+        return {
+          ...item,
+          options: enrichedOptions
+        }
+      }
+
       return item
     })
   }
@@ -1126,17 +1734,19 @@
   function buildSupplementalCharacteristics(documentRecord, sectionPages, characteristics) {
     const supplemental = []
     const existing = characteristics || []
-    const finishOptions = new Map()
+    const shellFinishOptions = new Map()
+    const baseFrameFinishOptions = new Map()
     const upholsteryOptions = new Map()
 
     ;(sectionPages || []).forEach((page) => {
       const text = getPageCombinedText(page)
       const signals = extractPageThemeSignals(text, documentRecord, page.pageNumber)
+      const extractedFinishOptions = extractSupplementalFinishOptionsFromText(text, page.pageNumber)
 
       signals.finishLabels.forEach((label) => {
         const key = normalizeText(label)
         if (!key) return
-        finishOptions.set(key, {
+        shellFinishOptions.set(key, {
           name: key.replace(/\s+Finish$/i, ""),
           values: "",
           pricing: extractOptionPricingFromText(text, key) || extractOptionPricingFromText(text, key.replace(/\s+Finish$/i, "")),
@@ -1144,6 +1754,8 @@
           evidence: `Detected on page ${page.pageNumber}`
         })
       })
+      extractedFinishOptions.shellOptions.forEach((value, key) => shellFinishOptions.set(key, value))
+      extractedFinishOptions.baseFrameOptions.forEach((value, key) => baseFrameFinishOptions.set(key, value))
 
       const categoryMatches = text.match(/\b(?:COM|COL|Category\s+\d+|Category\s+[A-Z])\b/gi) || []
       categoryMatches.forEach((match) => {
@@ -1169,14 +1781,25 @@
       }
     })
 
-    if (!hasCharacteristicLabel(existing, /shell finish|frame finish|wood finish|finish/i) && finishOptions.size >= 2) {
+    if (!hasCharacteristicLabel(existing, /shell finish|wood finish/i) && shellFinishOptions.size >= 2) {
       supplemental.push({
         id: "shell-finish",
         label: "Shell Finish",
-        blurb: "Finish options detected across the continuation pages for this product section.",
+        blurb: "Finish options detected across the pages gathered for this product or family.",
         dependencyNote: "",
         pricingNote: "",
-        options: [...finishOptions.values()]
+        options: [...shellFinishOptions.values()]
+      })
+    }
+
+    if (!hasCharacteristicLabel(existing, /base finish|frame finish|base \/ frame finish/i) && baseFrameFinishOptions.size >= 2) {
+      supplemental.push({
+        id: "base-frame-finish",
+        label: "Base / Frame Finish",
+        blurb: "Base or frame finish options detected across the pages gathered for this product or family.",
+        dependencyNote: "",
+        pricingNote: "",
+        options: [...baseFrameFinishOptions.values()]
       })
     }
 
@@ -1184,7 +1807,7 @@
       supplemental.push({
         id: "upholstery-material",
         label: "Upholstery / Material",
-        blurb: "Upholstery or material-related options detected across the continuation pages for this product section.",
+        blurb: "Upholstery or material-related options detected across the pages gathered for this product or family.",
         dependencyNote: "",
         pricingNote: "",
         options: [...upholsteryOptions.values()]
@@ -1304,7 +1927,7 @@
         aiStatus: scoredPageSet.has(pageNumber) ? "filtered_out" : "not_scored"
       })
     )
-    return ordered
+    return ordered.slice(0, getAiKeptPageLimit())
   }
 
   function extractResponseText(payload) {
@@ -1574,6 +2197,7 @@
     }
     appState.activePageNumber = pageNumber
     render()
+    ensureFamilyPageProducts(pageNumber).catch(() => {})
     requestAnimationFrame(() => {
       const viewerScroll = document.getElementById("viewer-scroll")
       const targetPage = document.querySelector(`.pdf-page[data-page-number="${pageNumber}"]`)
@@ -2100,6 +2724,38 @@
     return ""
   }
 
+  function getSelectedPageSubtypeHint(documentRecord, selectedPage) {
+    if (!selectedPage) return ""
+
+    const aiOrderedPages = getAiOrderedPages(appState.rankedPages.slice(0, getAiRerankCandidateLimit()).map((page) => ({
+      ...page,
+      metrics: getPageTextMetrics(documentRecord, page.pageNumber)
+    })))
+    const aiPage = aiOrderedPages.find((page) => page.pageNumber === selectedPage.pageNumber)
+    const aiLabel = aiPage ? getAiOnlyTopPageLabel(aiPage) : ""
+    if (aiLabel) return aiLabel
+
+    const rankedPage = appState.rankedPages.find((page) => page.pageNumber === selectedPage.pageNumber)
+    if (rankedPage) {
+      const fallbackLabel = getRelativePageDescriptor(documentRecord, selectedPage.pageNumber, rankedPage, appState.rankedPages.slice(0, 5))
+      if (fallbackLabel) return fallbackLabel
+    }
+
+    return ""
+  }
+
+  function getFamilyPageSelectionCandidates(documentRecord, pageNumber) {
+    if (getSpecParsingMode() !== "family") return []
+    const selectedPage = documentRecord?.pages?.find((page) => page.pageNumber === pageNumber)
+    if (!selectedPage) return []
+    const subtypeHint = getSelectedPageSubtypeHint(documentRecord, selectedPage)
+    return extractConcreteVariantCandidatesFromPageText(getPageCombinedText(selectedPage), subtypeHint)
+  }
+
+  function getFamilyPageSelectionKey(documentRecord, pageNumber) {
+    return `${documentRecord?.id || "unknown"}:${pageNumber}`
+  }
+
   function getPageRetrievalExplanation(documentRecord, pageNumber) {
     const page = documentRecord?.pages.find((item) => item.pageNumber === pageNumber)
     const text = getPageCombinedText(page)
@@ -2238,7 +2894,7 @@
 
     const topMatch = appState.rankedPages[0]
     const hasAiForActiveDocument = Boolean(appState.aiRerankResult && appState.aiRerankDocumentId === documentRecord?.id)
-    const topPages = getAiOrderedPages(appState.rankedPages.slice(0, 5).map((page) => ({
+    const topPages = getAiOrderedPages(appState.rankedPages.slice(0, getAiRerankCandidateLimit()).map((page) => ({
       ...page,
       metrics: getPageTextMetrics(documentRecord, page.pageNumber)
     })))
@@ -2249,6 +2905,8 @@
       ? sourceScoreById.get(documentRecord?.id)
       : null
     const decisionResult = appState.decisionAssistResult
+    const parsingModeConfig = getSpecParsingModeConfig(decisionResult?.parsingMode || "")
+    const isFamilyMode = getSpecParsingMode() === "family"
     const selectedProductId = normalizeText(decisionResult?.selectedProductId || "")
     const selectedVariantId = normalizeText(decisionResult?.selectedVariantId || "")
     const showProductSelector = (decisionResult?.productCandidates?.length || 0) > 1 && !selectedProductId
@@ -2269,7 +2927,8 @@
         ? decisionCharacteristics[appState.activeDecisionChoiceIndex]
         : null
     const pageExplanation = appState.wordStatsPage ? getPageRetrievalExplanation(documentRecord, appState.wordStatsPage) : null
-    const viewerTopPages = (hasAiForActiveDocument ? topPages.slice(0, 3) : appState.rankedPages.slice(0, 3).map((page) => ({
+    const viewerPageLimit = getSpecParsingMode() === "family" ? getFamilyResultPageLimit() : 3
+    const viewerTopPages = (hasAiForActiveDocument ? topPages.slice(0, viewerPageLimit) : appState.rankedPages.slice(0, viewerPageLimit).map((page) => ({
       ...page,
       metrics: getPageTextMetrics(documentRecord, page.pageNumber)
     })))
@@ -2286,11 +2945,15 @@
       !hasAiForActiveDocument
     )
     const gateViewerUntilAiReady = waitingOnAiLabels
-    const canShowPageStripNav = false
+    const canShowPageStripNav = viewerTopPages.length > 3
     const showHelpSpecPanel = Boolean(
       documentRecord &&
       (appState.decisionAssistLoading || decisionResult || appState.errorMessage || appState.aiRerankError || appState.decisionAssistError)
     )
+    const familyPageSelectionKey = documentRecord ? getFamilyPageSelectionKey(documentRecord, appState.activePageNumber) : ""
+    const activeFamilyPageSelections = familyPageSelectionKey ? (appState.familyPageProductsByKey[familyPageSelectionKey] || []) : []
+    const activeFamilyPageSelectionStatus = familyPageSelectionKey ? (appState.familyPageProductsStatusByKey[familyPageSelectionKey] || "") : ""
+    const activeFamilyPageSelectionError = familyPageSelectionKey ? (appState.familyPageProductsErrorByKey[familyPageSelectionKey] || "") : ""
     const statusScore = Number.isFinite(activeDocumentSourceScore)
       ? activeDocumentSourceScore
       : topMatch
@@ -2386,7 +3049,7 @@
                                   </button>
                                   ${
                                     isActive
-                                      ? `<button class="page-chip-ai-btn" data-help-spec-page="${page.pageNumber}" type="button" aria-label="Help me spec this page">✧</button>`
+                                      ? (isFamilyMode ? "" : `<button class="page-chip-ai-btn" data-help-spec-page="${page.pageNumber}" type="button" aria-label="Help me spec this page">✧</button>`)
                                       : ""
                                   }
                                 </div>
@@ -2402,6 +3065,41 @@
               : ""}
 
             ${documentRecord && gateViewerUntilAiReady ? `<div class="page-strip"></div>` : ""}
+
+            ${
+              documentRecord && isFamilyMode && !gateViewerUntilAiReady && (Boolean(activeFamilyPageSelections.length) || activeFamilyPageSelectionStatus === "loading" || activeFamilyPageSelectionStatus === "error")
+                ? `
+                  <div class="help-spec-panel">
+                    <div class="help-spec-card">
+                      <div class="help-spec-selector-block">
+                        <div class="help-spec-selector-head">
+                          <p class="help-spec-selector-title">Select the product on page ${appState.activePageNumber}</p>
+                          <p class="help-spec-selector-copy">Choose the exact product row shown on this page. Help Me Spec will start only after this selection, so the system does not need to infer the product from the whole family.</p>
+                        </div>
+                        ${
+                          activeFamilyPageSelectionStatus === "loading"
+                            ? `<p class="help-spec-loading-inline">${escapeHtml("Reading visible product rows on this page...")}</p>`
+                            : activeFamilyPageSelectionStatus === "error"
+                              ? `<p class="inline-ai-error">${escapeHtml(activeFamilyPageSelectionError || "Unable to detect the visible products on this page.")}</p>`
+                              : `
+                                <div class="help-spec-selector-grid">
+                                  ${activeFamilyPageSelections
+                                    .map((candidate) => `
+                                      <button class="help-spec-selector-card" data-help-spec-page-product="${escapeHtmlAttribute(candidate.id)}" type="button">
+                                        <strong>${escapeHtml(candidate.label)}</strong>
+                                        ${candidate.description ? `<span>${escapeHtml(candidate.description)}</span>` : ""}
+                                      </button>
+                                    `)
+                                    .join("")}
+                                </div>
+                              `
+                        }
+                      </div>
+                    </div>
+                  </div>
+                `
+                : ""
+            }
 
             ${showHelpSpecPanel
               ? `
@@ -2484,8 +3182,8 @@
                               ? `
                                 <div class="help-spec-selector-block">
                                   <div class="help-spec-selector-head">
-                                    <p class="help-spec-selector-title">Select the product on this page</p>
-                                    <p class="help-spec-selector-copy">This starting page appears to contain more than one product. Choose the one you want, then the system will scan forward until the next page is no longer the same product.</p>
+                                    <p class="help-spec-selector-title">${escapeHtml(parsingModeConfig.selectorProductTitle)}</p>
+                                    <p class="help-spec-selector-copy">${escapeHtml(parsingModeConfig.selectorProductCopy)}</p>
                                   </div>
                                   <div class="help-spec-selector-grid">
                                     ${decisionResult.productCandidates
@@ -2506,8 +3204,8 @@
                               ? `
                                 <div class="help-spec-selector-block">
                                   <div class="help-spec-selector-head">
-                                    <p class="help-spec-selector-title">Select the variant to review</p>
-                                    <p class="help-spec-selector-copy">This starting page appears to contain more than one variant for the same product. Pick the one you want before the spec characteristics are shown.</p>
+                                    <p class="help-spec-selector-title">${escapeHtml(parsingModeConfig.selectorVariantTitle)}</p>
+                                    <p class="help-spec-selector-copy">${escapeHtml(parsingModeConfig.selectorVariantCopy)}</p>
                                   </div>
                                   <div class="help-spec-selector-grid">
                                     ${decisionResult.variantCandidates
@@ -2604,7 +3302,7 @@
                                                             ? `
                                                               <div class="configuration-matrix">
                                                                 <div class="configuration-matrix-row configuration-matrix-head">
-                                                                  <span>Arm Type</span>
+                                                                  <span>${escapeHtml(configurationMatrix.rowLabel || "Configuration")}</span>
                                                                   ${configurationMatrix.columns.map((column) => `<span>${escapeHtml(column)}</span>`).join("")}
                                                                 </div>
                                                                 ${configurationMatrix.rows
@@ -3182,6 +3880,15 @@
       })
     })
 
+    document.querySelectorAll("[data-help-spec-page-product]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const productId = button.getAttribute("data-help-spec-page-product")
+        const pageNumber = appState.activePageNumber
+        if (!productId || !pageNumber) return
+        await analyzeSpecDecisions(pageNumber, { selectedProductId: productId, selectedVariantId: productId })
+      })
+    })
+
     document.getElementById("page-strip-track")?.addEventListener("scroll", () => {
       const track = document.getElementById("page-strip-track")
       if (!track) return
@@ -3369,6 +4076,9 @@
     appState.sourceSelectionScores = []
     appState.sourceSelectionChosenId = ""
     appState.decisionAssistResult = null
+    appState.familyPageProductsByKey = {}
+    appState.familyPageProductsStatusByKey = {}
+    appState.familyPageProductsErrorByKey = {}
     appState.activeDecisionChoiceIndex = -1
     appState.decisionTabsWindowStart = 0
     appState.decisionAssistError = ""
@@ -3446,6 +4156,9 @@
     appState.sourceSelectionScores = []
     appState.sourceSelectionChosenId = ""
     appState.decisionAssistResult = null
+    appState.familyPageProductsByKey = {}
+    appState.familyPageProductsStatusByKey = {}
+    appState.familyPageProductsErrorByKey = {}
     appState.activeDecisionChoiceIndex = -1
     appState.decisionTabsWindowStart = 0
     appState.decisionAssistError = ""
@@ -3799,6 +4512,96 @@
     }
   }
 
+  async function analyzeFamilyPageProductsWithVision(documentRecord, pageNumber) {
+    if (!appState.visionApiKey) {
+      throw new Error("Add an OpenAI API key before extracting page products.")
+    }
+
+    const canvas = await renderPdfPageToCanvas(documentRecord, pageNumber, 1.6)
+    const imageUrl = canvas.toDataURL("image/png")
+    const selectedPage = documentRecord?.pages?.find((page) => page.pageNumber === pageNumber)
+    const subtypeHint = getSelectedPageSubtypeHint(documentRecord, selectedPage)
+    const prompt = [
+      "You are reading a furniture manufacturer PDF page image.",
+      "Goal: detect the concrete product rows shown on this single page so the UI can let the user pick the exact product before any spec analysis runs.",
+      "Return only products visibly present on this page image.",
+      "Do not infer additional family products from other pages.",
+      "Do not return abstract buckets such as Base Type, Upholstery Type, Finish Type, or Variant.",
+      "Prefer one card per visible item/model row.",
+      "Each product should include the model code if visible and a short distinguishing label based on the visible description.",
+      subtypeHint ? `The page itself appears to be scoped to: ${subtypeHint}. Only return rows that match that scope.` : "Subtype hint: none",
+      "If the page shows exactly three products, return three products.",
+      "Return JSON only with no markdown fences.",
+      "",
+      "Required JSON shape:",
+      "{",
+      '  "products": [',
+      '    {"id": "gl-10", "label": "Exposed Veneer Shell / Interior Upholstery", "description": "GL-10", "evidence": "visible item row"}',
+      "  ]",
+      "}"
+    ].join("\n")
+
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${appState.visionApiKey}`
+      },
+      body: JSON.stringify({
+        model: appState.visionModel || DEFAULT_VISION_MODEL,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: prompt },
+              { type: "input_image", image_url: imageUrl }
+            ]
+          }
+        ]
+      })
+    })
+
+    if (!response.ok) {
+      const errorBody = await response.text()
+      throw new Error(`Family page extraction failed (${response.status}): ${errorBody.slice(0, 180)}`)
+    }
+
+    const payload = await response.json()
+    const rawText = extractResponseText(payload)
+    const parsed = parseJsonPayload(rawText)
+    if (!parsed) {
+      throw new Error("Family page extraction returned unreadable JSON.")
+    }
+
+    return normalizeDecisionCandidates(parsed.products)
+  }
+
+  async function ensureFamilyPageProducts(pageNumber) {
+    const documentRecord = getActiveDocument()
+    if (!documentRecord || getSpecParsingMode() !== "family" || !Number.isFinite(Number(pageNumber))) return
+    const key = getFamilyPageSelectionKey(documentRecord, pageNumber)
+    if (appState.familyPageProductsByKey[key]?.length) return
+    if (appState.familyPageProductsStatusByKey[key] === "loading") return
+    if (!appState.visionApiKey) return
+
+    try {
+      appState.familyPageProductsStatusByKey[key] = "loading"
+      appState.familyPageProductsErrorByKey[key] = ""
+      renderPreservingViewerScroll()
+
+      const products = await analyzeFamilyPageProductsWithVision(documentRecord, pageNumber)
+      appState.familyPageProductsByKey[key] = products
+      appState.familyPageProductsStatusByKey[key] = "done"
+      appState.familyPageProductsErrorByKey[key] = ""
+    } catch (error) {
+      appState.familyPageProductsByKey[key] = []
+      appState.familyPageProductsStatusByKey[key] = "error"
+      appState.familyPageProductsErrorByKey[key] = error instanceof Error ? error.message : "Unable to extract products from this page."
+    } finally {
+      renderPreservingViewerScroll()
+    }
+  }
+
   async function aiRerankTopPages(useActiveDocumentOnly) {
     let documentRecord = getActiveDocument()
     if (!useActiveDocumentOnly && appState.documents.length > 1) {
@@ -3834,7 +4637,7 @@
       return
     }
 
-    const candidatePages = rankPages(documentRecord).slice(0, 5)
+    const candidatePages = rankPages(documentRecord).slice(0, getAiRerankCandidateLimit())
     if (!candidatePages.length) {
       appState.aiRerankError = "No ranked pages are available yet."
       render()
@@ -3959,7 +4762,7 @@
         }))
         .filter((item) => Number.isFinite(item.pageNumber))
       const strongPages = orderedPages.filter((item) => Number.isFinite(item.aiScore) && item.aiScore >= 60)
-      const keptPages = (strongPages.length ? strongPages : orderedPages.slice(0, 3)).map((item) => item.pageNumber)
+      const keptPages = (strongPages.length ? strongPages : orderedPages.slice(0, getAiKeptPageLimit())).map((item) => item.pageNumber)
       const bestPage = keptPages.includes(Number(parsed.best_page)) ? Number(parsed.best_page) : keptPages[0]
       const variantComparison = Array.isArray(parsed.variant_comparison)
         ? parsed.variant_comparison
@@ -4016,6 +4819,7 @@
     try {
       appState.decisionAssistLoading = true
       appState.helpSpecLoadingLineIndex = 0
+      appState.helpSpecLoadingLineOrder = buildHelpSpecLoadingLineOrder()
       appState.decisionAssistError = ""
       appState.decisionAssistResult = null
       appState.activeDecisionChoiceIndex = -1
@@ -4026,41 +4830,67 @@
 
       const requestedPageNumber = Number.isFinite(Number(targetPageNumber)) ? Number(targetPageNumber) : appState.activePageNumber
       const selectedPage = documentRecord.pages.find((page) => page.pageNumber === requestedPageNumber)
+      const parsingModeConfig = getSpecParsingModeConfig()
       if (!selectedPage) {
         throw new Error("Select a page first before running spec decision analysis.")
       }
 
-      const candidatePages = documentRecord.pages
-        .filter((page) => page.pageNumber >= selectedPage.pageNumber)
-        .slice(0, 6)
+      const selectedProductHint = normalizeText(selectionHints.selectedProductId || "")
+      const selectedVariantHint = normalizeText(selectionHints.selectedVariantId || "")
+      const candidatePages = getDecisionCandidatePages(documentRecord, selectedPage, selectionHints)
       if (!candidatePages.length) {
         throw new Error("No candidate pages were found for spec analysis.")
       }
       const candidateRangeLabel = formatPageRangeLabel(candidatePages.map((page) => page.pageNumber))
-      const selectedProductHint = normalizeText(selectionHints.selectedProductId || "")
-      const selectedVariantHint = normalizeText(selectionHints.selectedVariantId || "")
 
       const content = [
         {
           type: "input_text",
           text: [
             "You are helping a furniture spec editor understand how to spec a product from a manufacturer PDF.",
+            `Brand: ${appState.spec.brandDisplayName || appState.spec.originalBrand || "Unknown"}`,
             `Product name: ${appState.spec.specDisplayName || appState.spec.originalSpecName || "Unknown"}`,
-            `The user selected page ${selectedPage.pageNumber}. Candidate contiguous pages are ${candidateRangeLabel}.`,
-            "Treat the clicked page as the entry point into a product section, not necessarily the whole answer.",
-            "First determine how many products appear on the starting page.",
-            "If more than one product appears on the starting page and no selected product hint is provided, return product candidates and do not generate characteristics yet.",
+            `The user selected page ${selectedPage.pageNumber}. Candidate ${parsingModeConfig.pageLabel} pages are ${candidateRangeLabel}.`,
+            parsingModeConfig.mode === "family"
+              ? "Treat the clicked page as the entry point into a product family, not necessarily a single product."
+              : "Treat the clicked page as the entry point into a product section, not necessarily the whole answer.",
+            parsingModeConfig.mode === "family" && !selectedProductHint && !selectedVariantHint
+              ? "At this stage, analyze only the clicked page. Do not scan forward and do not use later family pages yet."
+              : "",
+            "First determine whether the starting page contains one exact product, multiple related variants of one family, or multiple distinct products.",
+            parsingModeConfig.mode === "family"
+              ? "If the clicked page contains multiple distinct products or multiple variant rows for the same family, assume that page is self-contained for Help Me Spec and do not expand to other pages."
+              : "",
+            "If more than one distinct product appears on the starting page and no selected product hint is provided, return product candidates and do not generate characteristics yet.",
             "Product selection happens only on the starting page.",
-            "If a selected product hint is provided, use that product as the active context for the forward scan.",
-            "Then determine the contiguous related page range by scanning forward only.",
-            "Keep including the next page only while it still belongs to the same product selected from the starting page.",
-            "Stop at the first page that is clearly not the same contiguous product section.",
-            "If later pages are clearly separate variant pages with their own page-selector entries in the main UI, do not include them in this Help Me Spec result.",
-            "Only return variant candidates when the starting page itself contains multiple variants of the same product that would materially change the downstream characteristic modules.",
+            parsingModeConfig.mode === "family"
+              ? "If a selected product hint is provided, use that product as the active context, but stay on the clicked page unless expansion is explicitly required by referenced shared specs."
+              : "If a selected product hint is provided, use that product as the active context for the forward scan.",
+            parsingModeConfig.mode === "family"
+              ? "For this Davis-style family document, do not assume one page equals one product and do not use adjacent-page proximity as the main rule."
+              : "Then determine the contiguous related page range by scanning forward only.",
+            parsingModeConfig.mode === "family"
+              ? "Default to the clicked page only. Expand included_pages beyond the clicked page only when the clicked page explicitly depends on shared specification pages, finish references, or powder coat references that are required to understand the selected result."
+              : "Keep including the next page only while it still belongs to the same product selected from the starting page.",
+            parsingModeConfig.mode === "family"
+              ? "If the starting page contains multiple related variants and no selected variant hint is provided, return variant candidates before characteristics."
+              : "Stop at the first page that is clearly not the same contiguous product section.",
+            parsingModeConfig.mode === "family" && !selectedProductHint && !selectedVariantHint
+              ? "Variant candidates must come only from what is actually shown on the clicked page."
+              : "",
+            parsingModeConfig.mode === "family" && !selectedVariantHint
+              ? "When the clicked page lists concrete model rows or item codes, return those exact on-page variants as the variant candidates. Do not return abstract buckets such as Base Type, Upholstery Type, or Finish Type."
+              : "",
+            parsingModeConfig.mode === "family"
+              ? "For vague family-level matches, assume the user wants the family first, then progressively narrow by product selector, variant selector, and finally spec tabs."
+              : "If later pages are clearly separate variant pages with their own page-selector entries in the main UI, do not include them in this Help Me Spec result.",
+            "Only return variant candidates when the starting page itself contains multiple variants of the same product or family that would materially change the downstream characteristic modules.",
             "Once the product and variant context is clear, extract the specification characteristics from the included product pages.",
             "If a selected variant hint is provided, scope all downstream characteristics to that chosen variant only.",
             "Do not include sibling variant options, dimensions, finishes, or pricing once a specific variant has been selected.",
-            "Important example: if page 86 is the selected page and page 87 is its continuation, include page 87. If pages 88 and 89 are clearly separate variant pages with their own page-selector entries, do not include them in the page 86 Help Me Spec result.",
+            parsingModeConfig.mode === "family"
+              ? "Important Davis example: if the family has one page with multiple variants and another page with shared finish or powder coat references, include both when they apply to the selected product or variant even if they are not adjacent."
+              : "Important example: if page 86 is the selected page and page 87 is its continuation, include page 87. If pages 88 and 89 are clearly separate variant pages with their own page-selector entries, do not include them in the page 86 Help Me Spec result.",
             "Map content into meaningful characteristic types such as Size / Dimensions, Configuration, Shell / Frame Finish, Upholstery / Material, Surface / Top Material, Compliance / Certifications, or Options / Add-ons when those fit.",
             "Use more specific labels like Shell Finish or Frame Finish when the source supports it.",
             "Configuration tab rendering rules: use a single Configuration tab only when pricing depends on a combination of multiple structural variables.",
@@ -4197,15 +5027,20 @@
       const includedPagesRaw = Array.isArray(parsed.included_pages)
         ? parsed.included_pages.map((value) => Number(value)).filter((value) => Number.isFinite(value) && candidatePageSet.has(value))
         : []
-      const includedPages = [selectedPage.pageNumber]
-      const sortedIncluded = [...new Set(includedPagesRaw)].sort((a, b) => a - b)
-      let expectedPage = selectedPage.pageNumber + 1
-      sortedIncluded.forEach((pageNumber) => {
-        if (pageNumber === expectedPage) {
-          includedPages.push(pageNumber)
-          expectedPage += 1
-        }
-      })
+      const sortedIncluded = [...new Set([selectedPage.pageNumber, ...includedPagesRaw])].sort((a, b) => a - b)
+      const includedPages = parsingModeConfig.mode === "family"
+        ? sortedIncluded
+        : (() => {
+            const pages = [selectedPage.pageNumber]
+            let expectedPage = selectedPage.pageNumber + 1
+            sortedIncluded.forEach((pageNumber) => {
+              if (pageNumber === expectedPage) {
+                pages.push(pageNumber)
+                expectedPage += 1
+              }
+            })
+            return pages
+          })()
       const pageRangeLabel = formatPageRangeLabel(includedPages)
       const resolvedProductName = normalizeText(parsed.product_context?.product_name || "")
       const productCandidates = filterCandidatesToResolvedProduct(
@@ -4215,7 +5050,16 @@
         ),
         resolvedProductName
       )
-      const rawVariantCandidates = normalizeDecisionCandidates(parsed.variant_candidates)
+      const rawVariantCandidates = preferConcretePageVariants(
+        filterVariantCandidatesToSelectedPage(
+          normalizeDecisionCandidates(parsed.variant_candidates),
+          selectedPage,
+          documentRecord
+        ),
+        selectedPage,
+        selectedVariantHint || parsed.selected_variant_id || "",
+        documentRecord
+      )
       const characteristics = splitOvergroupedConfiguration(normalizeDecisionCharacteristics(parsed.characteristics))
       const includedPageRecords = includedPages
         .map((pageNumber) => documentRecord.pages.find((page) => page.pageNumber === pageNumber))
@@ -4247,11 +5091,16 @@
         variantCandidates,
         selectedVariantHint || parsed.selected_variant_id || ""
       )
+      const prunedCharacteristics = pruneResolvedConfigurationCharacteristics(
+        hydratedCharacteristics,
+        selectedVariantHint || parsed.selected_variant_id || ""
+      )
       const resolvedSelectedProductId = normalizeText(parsed.selected_product_id || selectedProductHint || (productCandidates.length === 1 ? productCandidates[0].id : ""))
       const resolvedSelectedVariantId = normalizeText(parsed.selected_variant_id || selectedVariantHint || (variantCandidates.length === 1 ? variantCandidates[0].id : ""))
 
       appState.decisionAssistResult = {
         pageNumber: selectedPage.pageNumber,
+        parsingMode: parsingModeConfig.mode,
         pageRangeLabel,
         includedPages,
         productName: resolvedProductName,
@@ -4263,10 +5112,10 @@
         selectedProductId: resolvedSelectedProductId,
         variantCandidates,
         selectedVariantId: resolvedSelectedVariantId,
-        characteristics: hydratedCharacteristics,
+        characteristics: prunedCharacteristics,
         referenceInfo
       }
-      appState.activeDecisionChoiceIndex = hydratedCharacteristics.length ? 0 : -1
+      appState.activeDecisionChoiceIndex = prunedCharacteristics.length ? 0 : -1
       appState.decisionTabsWindowStart = 0
 
       renderPreservingViewerScroll()
@@ -4448,6 +5297,58 @@
     const top = rankedPages[0]
     if (!documentRecord || !top) {
       return null
+    }
+
+    if (getSpecParsingMode() === "family") {
+      const topPages = rankedPages.slice(0, 4).map((page) => ({
+        ...page,
+        text: getPageCombinedText(documentRecord.pages.find((candidate) => candidate.pageNumber === page.pageNumber))
+      }))
+      const visualSignals = summarizeVisualSignals(topPages)
+      const options = extractAmbiguityOptions(topPages)
+      const second = rankedPages[1]
+      const weakTopMatch = top.score < 24
+      const closeCompetition = second && top.score - second.score <= 8
+
+      if (weakTopMatch) {
+        return {
+          status: "no_match",
+          title: "No strong family match yet",
+          confidenceLabel: "Needs more context",
+          recommendedPage: 1,
+          reason: "The current product-name signals are not distinctive enough to isolate the right family pages with confidence.",
+          question: "Try a more specific family, product, or variant name.",
+          options: [],
+          visualSignals,
+          topPages: []
+        }
+      }
+
+      if (!appState.assistantSelection && options.length >= 2 && closeCompetition) {
+        return {
+          status: "ambiguous",
+          title: "Multiple family matches detected",
+          confidenceLabel: "Ambiguous family match",
+          recommendedPage: top.pageNumber,
+          reason: "Several non-adjacent pages look relevant to the same search. Pick the product or variant that matches, then the viewer will retarget that family context.",
+          question: "Select the model, product, or variant that best matches the family you want.",
+          options,
+          visualSignals,
+          topPages: rankedPages.slice(0, 3).map((page) => page.pageNumber)
+        }
+      }
+
+      return {
+        status: "match",
+        title: "Likely family pages found",
+        confidenceLabel: top.score >= 90 ? "High confidence" : "Medium confidence",
+        recommendedPage: top.pageNumber,
+        reason: "The strongest matches are based on family relevance and shared reference signals, not adjacent-page clustering.",
+        question: "",
+        options: [],
+        visualSignals,
+        topPages: rankedPages.slice(0, 3).map((page) => page.pageNumber)
+      }
     }
 
     const clusters = buildPageClusters(rankedPages)
