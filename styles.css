@@ -455,6 +455,28 @@ button {
   background: linear-gradient(180deg, rgba(255, 251, 235, 0.56), rgba(255, 255, 255, 0.96));
 }
 
+.help-spec-selection-lock {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 251, 235, 0.56), rgba(255, 255, 255, 0.96));
+}
+
+.help-spec-selection-label {
+  margin: 0 0 4px;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+.help-spec-selection-lock strong {
+  font-size: 0.9rem;
+}
+
 .help-spec-context-head {
   display: flex;
   align-items: flex-start;

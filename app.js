@@ -6,6 +6,7 @@
   const DEFAULT_BUNDLED_PDF_PATH = "./PBHCL%20(4).pdf"
   const DEFAULT_BUNDLED_PDF_NAME = "PBHCL (4).pdf"
   const DEFAULT_VISION_MODEL = "gpt-4.1"
+  const PRODUCT_FIRST_CONFIDENCE_THRESHOLD = 0.78
   const HELP_SPEC_LOADING_INTERVAL_MS = 4200
   const HELP_SPEC_LOADING_LINES = [
     "Analyzing details... good specs take a beat.",
@@ -105,6 +106,8 @@
     aiRerankResult: null,
     aiRerankDocumentId: "",
     aiRerankCacheByDocumentId: {},
+    structureRouting: null,
+    productFirstSelection: null,
     aiRerankError: "",
     sourceSelectionScores: [],
     sourceSelectionChosenId: "",
@@ -528,6 +531,284 @@
     return 8
   }
 
+  function normalizeStructureType(value) {
+    const normalized = normalizeText(value).toLowerCase().replace(/\s+/g, "_")
+    if (normalized === "product_family") return "product_family"
+    if (normalized === "single_product") return "single_product"
+    return ""
+  }
+
+  function normalizeInteractionModel(value) {
+    const normalized = normalizeText(value).toLowerCase().replace(/\s+/g, "_")
+    if (normalized === "product_first") return "product_first"
+    if (normalized === "page_first") return "page_first"
+    return ""
+  }
+
+  function parseModelBoolean(value) {
+    if (typeof value === "boolean") return value
+    const normalized = normalizeText(value).toLowerCase()
+    if (normalized === "true" || normalized === "yes") return true
+    if (normalized === "false" || normalized === "no") return false
+    return false
+  }
+
+  function getStructureTypeFromArchetype(mode) {
+    return mode === "family" ? "product_family" : "single_product"
+  }
+
+  function isAbstractProductBucket(label) {
+    const normalized = normalizeText(label).toLowerCase()
+    if (!normalized) return true
+    return /\b(base type|upholstery type|finish type|variant|configuration|material|wood base|wire base|pedestal|shell finish|frame finish|base finish)\b/.test(normalized)
+  }
+
+  function getConcreteProductCandidateKey(value) {
+    return normalizeText(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+  }
+
+  function isConcreteProductLabel(label) {
+    const normalized = normalizeText(label)
+    const lowered = normalized.toLowerCase()
+    if (!normalized || isAbstractProductBucket(normalized)) return false
+    if (/^(general|base|standard|variant\s+\d+|option\s+\d+|related|dimensions?(?:\s*&\s*sizes?)?|finish options?|material(?: specifications?)?)$/i.test(normalized)) {
+      return false
+    }
+    if (/(^| )(finish|oak|ash|walnut|ebony|palisander|upholstery|material|dimensions?|height|width|depth)( |$)/i.test(normalized) && !/(chair|stool|table|bench|sofa|ottoman|lounge|settee|desk|credenza|cabinet)/i.test(normalized)) {
+      return false
+    }
+    const tokenCount = lowered.split(/\s+/).filter(Boolean).length
+    return tokenCount >= 2 || /\b[A-Z]{1,4}-\d{1,3}[A-Z0-9-]*\b/.test(normalized)
+  }
+
+  function normalizeConcreteProductCandidates(items) {
+    const unique = new Map()
+    normalizeDecisionCandidates(items).forEach((candidate) => {
+      const mapKey = getConcreteProductCandidateKey(candidate.label || candidate.id)
+      if (!mapKey || !isConcreteProductLabel(candidate.label)) return
+      if (!unique.has(mapKey)) {
+        unique.set(mapKey, candidate)
+      }
+    })
+    return [...unique.values()]
+  }
+
+  function getTopRerankedPageNumbers(aiResult) {
+    if (!aiResult) return []
+    const kept = Array.isArray(aiResult.keptPages) ? aiResult.keptPages : []
+    if (kept.length) return kept.slice(0, 3)
+    const ordered = Array.isArray(aiResult.orderedPages) ? aiResult.orderedPages.map((item) => item.pageNumber).filter(Number.isFinite) : []
+    return ordered.slice(0, 3)
+  }
+
+  function buildGroundedProductCandidatesFromTopPages(documentRecord, aiResult) {
+    if (!documentRecord || !aiResult) return []
+
+    const pageNumbers = getTopRerankedPageNumbers(aiResult)
+    if (!pageNumbers.length) return []
+    const titles = pageNumbers.map((pageNumber) => getPrimaryHeaderTitle(documentRecord, pageNumber)).filter(Boolean)
+    const sharedPrefix = getSharedTitlePrefix(titles)
+    const prefixPattern = sharedPrefix
+      ? new RegExp(`^${sharedPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i")
+      : null
+
+    const candidates = pageNumbers
+      .map((pageNumber) => {
+        const title = normalizeText(getPrimaryHeaderTitle(documentRecord, pageNumber))
+        if (!title) return null
+        const stripped = prefixPattern
+          ? normalizeText(title.replace(prefixPattern, "")).replace(/^[,:\-–—]\s*/, "")
+          : ""
+        const label = isConcreteProductLabel(stripped) ? stripped : title
+        if (!isConcreteProductLabel(label)) return null
+        return {
+          id: slugify(label, `product-${pageNumber}`),
+          label,
+          description: title !== label ? title : "",
+          evidence: `Visible top family page title on page ${pageNumber}`
+        }
+      })
+      .filter(Boolean)
+
+    return normalizeConcreteProductCandidates(candidates)
+  }
+
+  function getAggregatedTopFamilyProductCandidates(documentRecord, aiResult) {
+    const combined = [
+      ...normalizeConcreteProductCandidates(aiResult?.concreteProductCandidates),
+      ...buildGroundedProductCandidatesFromTopPages(documentRecord, aiResult)
+    ]
+    return normalizeConcreteProductCandidates(combined)
+  }
+
+  function isProductFirstSessionActive() {
+    return Boolean(appState.productFirstSelection?.active && normalizeText(appState.productFirstSelection?.productId))
+  }
+
+  function suppressProductFirstSiblingVariants(variantCandidates, selectedProductId, familyProductCandidates) {
+    const candidates = Array.isArray(variantCandidates) ? variantCandidates : []
+    if (!candidates.length) return []
+    const selectedKey = getConcreteProductCandidateKey(selectedProductId)
+    const familyKeys = new Set(
+      (familyProductCandidates || [])
+        .flatMap((candidate) => [candidate.id, candidate.label])
+        .map((value) => getConcreteProductCandidateKey(value))
+        .filter(Boolean)
+    )
+
+    const filtered = candidates.filter((candidate) => {
+      const labelKey = getConcreteProductCandidateKey(candidate.label)
+      const idKey = getConcreteProductCandidateKey(candidate.id)
+      if (selectedKey && (labelKey === selectedKey || idKey === selectedKey)) return false
+      if (familyKeys.has(labelKey) || familyKeys.has(idKey)) return false
+      if (/^model\s+[A-Z]{1,4}-\d{1,3}[A-Z0-9-]*$/i.test(normalizeText(candidate.label))) return false
+      return true
+    })
+
+    return filtered
+  }
+
+  function getProductCardModelCode(candidate) {
+    const description = normalizeText(candidate?.description || "")
+    const evidence = normalizeText(candidate?.evidence || "")
+    const sourceText = [description, evidence].filter(Boolean).join(" ")
+    const modelMatch = sourceText.match(/\b[A-Z]{1,4}-\d{1,3}[A-Z0-9-]*\b/)
+    return modelMatch ? modelMatch[0] : ""
+  }
+
+  function shouldShowSeparateProductCardModelCode(candidate) {
+    const modelCode = getProductCardModelCode(candidate)
+    const label = normalizeText(candidate?.label || "").toLowerCase()
+    if (!modelCode) return false
+    return !label.includes(modelCode.toLowerCase())
+  }
+
+  function getProductCardTitle(candidate) {
+    const label = normalizeText(candidate?.label || "")
+    const subtitle = getProductCardSubtitle(candidate)
+    if (!subtitle) return label
+
+    const normalizedLabel = label.toLowerCase()
+    const normalizedSubtitle = subtitle.toLowerCase()
+    if (normalizedSubtitle.includes(normalizedLabel) && normalizedSubtitle.length > normalizedLabel.length) {
+      return subtitle
+    }
+
+    return label
+  }
+
+  function getProductCardSubtitle(candidate) {
+    const description = normalizeText(candidate?.description || "")
+    const label = normalizeText(candidate?.label || "")
+    const modelCode = getProductCardModelCode(candidate)
+    const cleanedDescription = normalizeText(
+      description
+        .replace(/\bpage\s+\d+\b/gi, "")
+        .replace(/\bsection\b/gi, "")
+        .replace(/\s{2,}/g, " ")
+    )
+    if (!cleanedDescription) return ""
+
+    let simplified = cleanedDescription
+    if (label) {
+      simplified = normalizeText(
+        simplified.replace(new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"), "")
+      )
+    }
+    if (modelCode) {
+      simplified = normalizeText(
+        simplified.replace(new RegExp(modelCode.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "ig"), "")
+      )
+    }
+    simplified = normalizeText(simplified.replace(/^[,:\-–—]\s*/, ""))
+
+    if (!simplified || simplified.toLowerCase() === label.toLowerCase()) return ""
+    return simplified
+  }
+
+  function getDisplayProductCardSubtitle(candidate) {
+    const subtitle = getProductCardSubtitle(candidate)
+    const title = getProductCardTitle(candidate)
+    if (!subtitle) return ""
+    if (subtitle.toLowerCase() === title.toLowerCase()) return ""
+    const normalizedTitle = title.toLowerCase()
+    const normalizedSubtitle = subtitle.toLowerCase()
+    if (
+      normalizedSubtitle.length <= 20
+      && (
+        normalizedTitle.includes(normalizedSubtitle)
+        || /^(base|swivel|tilt|mechanism|fixed|memory return|four prong base)$/i.test(subtitle)
+      )
+    ) {
+      return ""
+    }
+    return subtitle
+  }
+
+  // Routing is intentionally conservative: product-first only activates when the
+  // reranked top pages expose grounded product labels we can safely present.
+  function buildStructureRoutingState(documentRecord = null) {
+    const activeDocument = documentRecord || getActiveDocument()
+    const archetype = getSpecParsingMode()
+    const fallbackPageNumber =
+      appState.aiRerankResult?.bestPage
+      || appState.rankedPages[0]?.pageNumber
+      || activeDocument?.pages?.[0]?.pageNumber
+      || 1
+    const fallback = {
+      structureType: getStructureTypeFromArchetype(archetype),
+      interactionModel: "page_first",
+      suggestedInteractionModel: "",
+      confidence: 0,
+      hasConcreteProducts: false,
+      productCandidates: [],
+      productFirstPageNumber: fallbackPageNumber,
+      source: "fallback"
+    }
+
+    if (!activeDocument || appState.aiRerankDocumentId !== activeDocument.id || !appState.aiRerankResult) {
+      return fallback
+    }
+
+    const aiResult = appState.aiRerankResult
+    const structureType = normalizeStructureType(aiResult.structureType) || getStructureTypeFromArchetype(archetype)
+    const suggestedInteractionModel = normalizeInteractionModel(aiResult.interactionModel)
+    const confidence = Number.isFinite(aiResult.structureConfidence) ? aiResult.structureConfidence : 0
+    const productCandidates = getAggregatedTopFamilyProductCandidates(activeDocument, aiResult)
+    const topPageNumbers = getTopRerankedPageNumbers(aiResult)
+    const hasConcreteProducts = Boolean(aiResult.hasConcreteProducts) && productCandidates.length > 1 && topPageNumbers.length > 0
+    const familySignalSupportsProductFirst =
+      structureType === "product_family"
+      || archetype === "family"
+
+    // Concrete visible product candidates outrank model confidence. If we can
+    // safely ground product choices on the top reranked family pages, keep the
+    // user in product-first mode and use pages only as downstream context.
+    const eligibleForProductFirst =
+      hasConcreteProducts
+      && familySignalSupportsProductFirst
+      && (
+        suggestedInteractionModel === "product_first"
+        || confidence >= PRODUCT_FIRST_CONFIDENCE_THRESHOLD
+        || archetype === "family"
+      )
+
+    return {
+      structureType,
+      suggestedInteractionModel,
+      interactionModel: eligibleForProductFirst ? "product_first" : "page_first",
+      confidence,
+      hasConcreteProducts,
+      productCandidates,
+      productFirstPageNumber: aiResult.bestPage || topPageNumbers[0] || fallbackPageNumber,
+      source: eligibleForProductFirst ? "grounded_products" : "fallback"
+    }
+  }
+
+  function updateStructureRoutingState(documentRecord = null) {
+    appState.structureRouting = buildStructureRoutingState(documentRecord)
+  }
+
   function getAiRerankCandidateLimit() {
     return getSpecParsingMode() === "family" ? 12 : 5
   }
@@ -845,6 +1126,54 @@
       .filter(Boolean)
   }
 
+  function getSelectedCandidateMatchTokens(candidates, selectedId) {
+    const selectedCandidate = (candidates || []).find((candidate) => normalizeText(candidate.id) === normalizeText(selectedId))
+    const source = selectedCandidate || { id: selectedId, label: selectedId }
+    const modelCode = getProductCardModelCode(source)
+    return [source.id, source.label, modelCode]
+      .map((value) => normalizeText(value).toLowerCase())
+      .filter(Boolean)
+      .filter((value) => value.length >= 5 || /\b[a-z]{1,4}-\d{1,4}\b/i.test(value))
+  }
+
+  function extractModelCodes(value) {
+    return [...new Set((normalizeText(value).match(/\b[A-Z]{1,4}-\d{1,4}[A-Z0-9-]*\b/g) || []).map((item) => normalizeText(item)))]
+  }
+
+  function getSelectedCandidate(candidates, selectedId) {
+    return (candidates || []).find((candidate) => normalizeText(candidate.id) === normalizeText(selectedId)) || null
+  }
+
+  function optionContainsSelectedAndSiblingModels(optionName, selectedModelCodes, siblingModelCodes) {
+    const optionModels = extractModelCodes(optionName)
+    if (!optionModels.length) return false
+    const hasSelected = optionModels.some((code) => selectedModelCodes.has(code))
+    const hasSibling = optionModels.some((code) => siblingModelCodes.has(code))
+    return hasSelected && hasSibling
+  }
+
+  function relabelCombinedOptionForSelectedProduct(option, selectedCandidate, selectedModelCodes, siblingModelCodes) {
+    const optionName = normalizeText(option?.name || "")
+    if (!optionContainsSelectedAndSiblingModels(optionName, selectedModelCodes, siblingModelCodes)) {
+      return option
+    }
+
+    const selectedLabel = normalizeText(selectedCandidate?.label || "")
+    const selectedModelCode = extractModelCodes(selectedCandidate?.description || selectedCandidate?.label || selectedCandidate?.id || "")
+      .find((code) => selectedModelCodes.has(code)) || [...selectedModelCodes][0] || ""
+
+    return {
+      ...option,
+      name: selectedLabel || selectedModelCode || optionName
+    }
+  }
+
+  function optionContainsSiblingModels(option, siblingModelCodes) {
+    const optionModels = extractModelCodes(option?.name || "")
+    if (!optionModels.length) return false
+    return optionModels.some((code) => siblingModelCodes.has(code))
+  }
+
   function optionMatchesVariant(option, tokens) {
     if (!tokens.length) return false
     const haystack = [
@@ -856,6 +1185,73 @@
       .map((value) => normalizeText(value).toLowerCase())
       .join(" ")
     return tokens.some((token) => haystack.includes(token))
+  }
+
+  function filterCharacteristicsForSelectedRecord(characteristics, candidates, selectedId) {
+    const selectedCandidate = getSelectedCandidate(candidates, selectedId)
+    const selectedTokens = getSelectedCandidateMatchTokens(candidates, selectedId)
+    const selectedModelCodes = new Set(extractModelCodes([
+      selectedCandidate?.id,
+      selectedCandidate?.label,
+      selectedCandidate?.description
+    ].filter(Boolean).join(" ")))
+    const siblingTokens = (candidates || [])
+      .filter((candidate) => normalizeText(candidate.id) !== normalizeText(selectedId))
+      .flatMap((candidate) => [candidate.id, candidate.label, getProductCardModelCode(candidate)])
+      .map((value) => normalizeText(value).toLowerCase())
+      .filter(Boolean)
+      .filter((value) => value.length >= 5 || /\b[a-z]{1,4}-\d{1,4}\b/i.test(value))
+    const siblingModelCodes = new Set(
+      (candidates || [])
+        .filter((candidate) => normalizeText(candidate.id) !== normalizeText(selectedId))
+        .flatMap((candidate) => extractModelCodes([candidate.id, candidate.label, candidate.description].filter(Boolean).join(" ")))
+    )
+
+    if (!selectedTokens.length) return characteristics || []
+
+    return (characteristics || []).map((characteristic) => {
+      const options = getCharacteristicOptions(characteristic)
+      const relabeledOptions = options.map((option) =>
+        relabelCombinedOptionForSelectedProduct(option, selectedCandidate, selectedModelCodes, siblingModelCodes)
+      )
+      const selectedMatches = relabeledOptions.filter((option) => optionMatchesVariant(option, selectedTokens))
+      const siblingMatches = options.filter((option) => optionMatchesVariant(option, siblingTokens))
+      if (!selectedMatches.length) return characteristic
+      if (!siblingMatches.length) {
+        return {
+          ...characteristic,
+          options: relabeledOptions
+        }
+      }
+
+      const containsCombinedSharedOptions = relabeledOptions.some((option) =>
+        optionContainsSelectedAndSiblingModels(option.name, selectedModelCodes, siblingModelCodes)
+      )
+      if (containsCombinedSharedOptions) {
+        const sharedOptions = relabeledOptions.map((option) => ({
+          ...option,
+          name: normalizeText(selectedCandidate?.label || option.name || "Selected Product")
+        }))
+        return {
+          ...characteristic,
+          options: sharedOptions,
+          blurb: normalizeText(characteristic?.blurb || "") || "Shared details that apply to the selected product."
+        }
+      }
+
+      const filteredSelectedOnly = selectedMatches.filter((option) => !optionContainsSiblingModels(option, siblingModelCodes))
+      if (filteredSelectedOnly.length) {
+        return {
+          ...characteristic,
+          options: filteredSelectedOnly
+        }
+      }
+
+      return {
+        ...characteristic,
+        options: selectedMatches
+      }
+    })
   }
 
   function filterCharacteristicsForSelectedVariant(characteristics, variantCandidates, selectedVariantId) {
@@ -879,6 +1275,17 @@
         options: selectedMatches
       }
     })
+  }
+
+  function getSelectedProductDisplayLabel(decisionResult, structureRouting) {
+    const selectedId = normalizeText(decisionResult?.selectedProductId || "")
+    if (!selectedId) return ""
+    const candidates = [
+      ...(decisionResult?.productCandidates || []),
+      ...(structureRouting?.productCandidates || [])
+    ]
+    const match = candidates.find((candidate) => normalizeText(candidate.id) === selectedId)
+    return normalizeText(match?.label || selectedId)
   }
 
   function mergeComColIntoDimensions(characteristics) {
@@ -2166,6 +2573,7 @@
     if (!documentRecord) {
       appState.rankedPages = []
       appState.activePageNumber = 1
+      updateStructureRoutingState(null)
       return
     }
 
@@ -2176,6 +2584,7 @@
     if (jumpToTopPage) {
       appState.activePageNumber = topMatch?.pageNumber || 1
     }
+    updateStructureRoutingState(documentRecord)
   }
 
   function cloneAiRerankResult(result) {
@@ -2184,7 +2593,8 @@
       ...result,
       keptPages: Array.isArray(result.keptPages) ? [...result.keptPages] : [],
       orderedPages: Array.isArray(result.orderedPages) ? result.orderedPages.map((item) => ({ ...item })) : [],
-      variantComparison: Array.isArray(result.variantComparison) ? result.variantComparison.map((item) => ({ ...item })) : []
+      variantComparison: Array.isArray(result.variantComparison) ? result.variantComparison.map((item) => ({ ...item })) : [],
+      concreteProductCandidates: Array.isArray(result.concreteProductCandidates) ? result.concreteProductCandidates.map((item) => ({ ...item })) : []
     }
   }
 
@@ -2293,6 +2703,7 @@
     appState.summaryPanelOpen = false
     appState.decisionAssistResult = null
     appState.decisionAssistError = ""
+    appState.productFirstSelection = null
     clearSelectionState()
     runRanking(true)
     if (cachedAiResult?.bestPage) {
@@ -2300,6 +2711,7 @@
     } else if (appState.rankedPages[0]?.pageNumber) {
       appState.activePageNumber = appState.rankedPages[0].pageNumber
     }
+    updateStructureRoutingState(getActiveDocument())
     render()
     requestAnimationFrame(() => setPage(appState.activePageNumber))
   }
@@ -2945,10 +3357,23 @@
       !hasAiForActiveDocument
     )
     const gateViewerUntilAiReady = waitingOnAiLabels
+    const productFirstSessionActive = isProductFirstSessionActive()
     const canShowPageStripNav = viewerTopPages.length > 3
     const showHelpSpecPanel = Boolean(
       documentRecord &&
       (appState.decisionAssistLoading || decisionResult || appState.errorMessage || appState.aiRerankError || appState.decisionAssistError)
+    )
+    const structureRouting = appState.structureRouting || buildStructureRoutingState(documentRecord)
+    const selectedProductDisplayLabel = getSelectedProductDisplayLabel(decisionResult, structureRouting)
+    const showProductFirstEntry = Boolean(
+      documentRecord
+      && !gateViewerUntilAiReady
+      && isFamilyMode
+      && structureRouting.interactionModel === "product_first"
+      && structureRouting.productCandidates.length > 1
+      && !productFirstSessionActive
+      && !decisionResult
+      && !appState.decisionAssistLoading
     )
     const familyPageSelectionKey = documentRecord ? getFamilyPageSelectionKey(documentRecord, appState.activePageNumber) : ""
     const activeFamilyPageSelections = familyPageSelectionKey ? (appState.familyPageProductsByKey[familyPageSelectionKey] || []) : []
@@ -2983,11 +3408,12 @@
               <input id="vision-api-key" type="password" value="${escapeHtml(appState.visionApiKey)}" placeholder="sk-..." />
             </div>
             <div class="session-submit">
-              <button class="session-submit-btn" id="session-submit-btn" type="button">
-                ${appState.loadingMessage ? "Working..." : "Submit"}
+              <button class="session-submit-btn" id="session-submit-btn" type="button" ${appState.analyzeRequestLoading ? "disabled" : ""}>
+                ${appState.analyzeRequestLoading || appState.loadingMessage ? "Working..." : "Submit"}
               </button>
             </div>
           </div>
+          ${appState.errorMessage ? `<p class="session-status session-status-error">${escapeHtml(appState.errorMessage)}</p>` : ""}
         </section>
 
         <section class="workspace-layout">
@@ -3025,7 +3451,7 @@
               `
               : ""}
 
-            ${documentRecord && !gateViewerUntilAiReady
+            ${documentRecord && !gateViewerUntilAiReady && !showProductFirstEntry && !productFirstSessionActive
               ? `
                 <div class="page-strip ${viewerTopPages.length <= 3 ? "page-strip-centered" : ""}">
                   ${canShowPageStripNav && appState.pageStripCanScrollLeft ? '<button class="page-strip-nav page-strip-nav-left" id="page-strip-nav-left" type="button" aria-label="Previous page results">‹</button>' : ""}
@@ -3064,10 +3490,38 @@
               `
               : ""}
 
+            ${
+              showProductFirstEntry
+                ? `
+                  <div class="help-spec-panel">
+                    <div class="help-spec-card">
+                      <div class="help-spec-selector-block">
+                        <div class="help-spec-selector-head">
+                          <p class="help-spec-selector-title">Select the product</p>
+                          <p class="help-spec-selector-copy">These product options are grounded in concrete visible labels or groups on the top strong or related family page${getTopRerankedPageNumbers(appState.aiRerankResult).length > 1 ? "s" : ""}. Choose one to start Help Me Spec without clicking a page first.</p>
+                        </div>
+                        <div class="help-spec-selector-grid">
+                          ${structureRouting.productCandidates
+                            .map((candidate) => `
+                              <button class="help-spec-selector-card" data-product-first-product="${escapeHtmlAttribute(candidate.id)}" type="button">
+                                <strong>${escapeHtml(getProductCardTitle(candidate))}</strong>
+                                ${shouldShowSeparateProductCardModelCode(candidate) ? `<span>${escapeHtml(getProductCardModelCode(candidate))}</span>` : ""}
+                                ${getDisplayProductCardSubtitle(candidate) ? `<em>${escapeHtml(getDisplayProductCardSubtitle(candidate))}</em>` : ""}
+                              </button>
+                            `)
+                            .join("")}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                `
+                : ""
+            }
+
             ${documentRecord && gateViewerUntilAiReady ? `<div class="page-strip"></div>` : ""}
 
             ${
-              documentRecord && isFamilyMode && !gateViewerUntilAiReady && (Boolean(activeFamilyPageSelections.length) || activeFamilyPageSelectionStatus === "loading" || activeFamilyPageSelectionStatus === "error")
+              documentRecord && isFamilyMode && !showProductFirstEntry && !productFirstSessionActive && !gateViewerUntilAiReady && (Boolean(activeFamilyPageSelections.length) || activeFamilyPageSelectionStatus === "loading" || activeFamilyPageSelectionStatus === "error")
                 ? `
                   <div class="help-spec-panel">
                     <div class="help-spec-card">
@@ -3115,6 +3569,19 @@
                       : decisionResult
                       ? `
                         <div class="help-spec-card">
+                          ${
+                            decisionResult.fromProductFirst && selectedProductDisplayLabel
+                              ? `
+                                <div class="help-spec-selection-lock">
+                                  <div>
+                                    <p class="help-spec-selection-label">Selected product</p>
+                                    <strong>${escapeHtml(selectedProductDisplayLabel)}</strong>
+                                  </div>
+                                  <button class="ghost-btn" data-change-product-selection type="button">Change selection</button>
+                                </div>
+                              `
+                              : ""
+                          }
                           ${
                             showDecisionContext
                               ? `
@@ -3889,6 +4356,31 @@
       })
     })
 
+    document.querySelectorAll("[data-product-first-product]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const productId = button.getAttribute("data-product-first-product")
+        const pageNumber = appState.structureRouting?.productFirstPageNumber || appState.aiRerankResult?.bestPage || appState.activePageNumber
+        if (!productId || !pageNumber) return
+        appState.productFirstSelection = {
+          active: true,
+          productId
+        }
+        setPage(pageNumber)
+        await analyzeSpecDecisions(pageNumber, { selectedProductId: productId, fromProductFirst: true })
+      })
+    })
+
+    document.querySelectorAll("[data-change-product-selection]").forEach((button) => {
+      button.addEventListener("click", () => {
+        appState.productFirstSelection = null
+        appState.decisionAssistResult = null
+        appState.activeDecisionChoiceIndex = -1
+        appState.decisionTabsWindowStart = 0
+        appState.decisionAssistError = ""
+        renderPreservingViewerScroll()
+      })
+    })
+
     document.getElementById("page-strip-track")?.addEventListener("scroll", () => {
       const track = document.getElementById("page-strip-track")
       if (!track) return
@@ -4054,6 +4546,7 @@
     const attributes = buildAttributesFromText(draft.attributes)
     if (!attributes.length) {
       appState.errorMessage = "Add at least one attribute before submitting."
+      showToast(appState.errorMessage)
       render()
       return
     }
@@ -4072,6 +4565,8 @@
     appState.aiRerankResult = null
     appState.aiRerankDocumentId = ""
     appState.aiRerankCacheByDocumentId = {}
+    appState.structureRouting = null
+    appState.productFirstSelection = null
     appState.aiRerankError = ""
     appState.sourceSelectionScores = []
     appState.sourceSelectionChosenId = ""
@@ -4085,7 +4580,9 @@
     appState.summaryPanelOpen = false
 
     if (!appState.uploadFiles.length && !appState.documents.length) {
+      appState.errorMessage = "No PDF is loaded yet. Upload a PDF or wait for the default document to finish loading."
       appState.loadingMessage = ""
+      showToast(appState.errorMessage)
       render()
       saveCurrentAsDefault().catch(() => {})
       return
@@ -4118,6 +4615,8 @@
       appState.activeDocumentId = bestDocument?.id || uploadedDocuments[0]?.id || ""
       appState.uploadFiles = []
       appState.aiRerankCacheByDocumentId = {}
+      appState.structureRouting = null
+      appState.productFirstSelection = null
       appState.rankedPages = []
       appState.pagePreviews = {}
       appState.pageRenderImages = {}
@@ -4152,6 +4651,8 @@
     appState.aiRerankResult = null
     appState.aiRerankDocumentId = ""
     appState.aiRerankCacheByDocumentId = {}
+    appState.structureRouting = null
+    appState.productFirstSelection = null
     appState.aiRerankError = ""
     appState.sourceSelectionScores = []
     appState.sourceSelectionChosenId = ""
@@ -4287,6 +4788,8 @@
       appState.aiRerankResult = null
       appState.aiRerankDocumentId = ""
       appState.aiRerankCacheByDocumentId = {}
+      appState.structureRouting = null
+      appState.productFirstSelection = null
       appState.aiRerankError = ""
       appState.sourceSelectionScores = []
       appState.sourceSelectionChosenId = ""
@@ -4693,15 +5196,31 @@
         "Prefer focused product detail pages, dimensions pages, and specification content.",
         "Deprioritize appendix charts, textile application matrices, broad tables, and pages that list many unrelated products.",
         "If a product reference image is provided, use it to compare visually against the candidate pages.",
+        "Additionally, determine the structural pattern of the candidate pages.",
+        "Does this appear to represent a single product with variants, or a family of multiple distinct products?",
+        "Identify whether multiple concrete products are visibly present.",
+        "Prefer decisions based on visible structure such as titles, section blocks, repeated layouts, and distinct spec tables, not assumptions.",
+        "Indicate confidence in this structure determination as a number from 0.0 to 1.0.",
+        "Indicate whether concrete visible product candidates are safely extractable from the top reranked page set.",
+        "If concrete visible product labels or groups are present on the top reranked page(s), return only those grounded options.",
+        "Do not return abstract buckets such as Base Type, Upholstery Type, Finish Type, Variant, or Configuration as concrete product candidates.",
         "Return JSON only with no markdown fences.",
         "",
         "Required JSON shape:",
         '{',
         '  "status": "single_match | similar_variants | unclear",',
+        '  "relationship": "same_product | same_family | different_products",',
         '  "best_page": 5,',
         '  "confidence": "high",',
         '  "summary": "short summary",',
         '  "question": "optional short question for the user",',
+        '  "structure_type": "single_product | product_family",',
+        '  "interaction_model": "page_first | product_first",',
+        '  "structure_confidence": 0.0,',
+        '  "has_concrete_products": true,',
+        '  "concrete_product_candidates": [',
+        '    {"id": "mid-back-lounge", "label": "Mid Back Lounge Chair", "description": "visible section title", "evidence": "top reranked page title"}',
+        "  ],",
         '  "variant_comparison": [',
         '    {"page_number": 86, "label": "Base", "difference": "base product page compared with nearby finish variants", "reason": "same chair and ottoman without a variant qualifier in the page title"},',
         '    {"page_number": 88, "label": "Ebony finish", "difference": "same product with Ebony called out", "reason": "page title or visible finish callout identifies Ebony"},',
@@ -4777,16 +5296,23 @@
 
       appState.aiRerankResult = {
         status: parsed.status || "single_match",
+        relationship: parsed.relationship || "",
         bestPage,
         confidence: parsed.confidence || "",
         summary: parsed.summary || "",
         question: parsed.question || "",
+        structureType: normalizeStructureType(parsed.structure_type),
+        interactionModel: normalizeInteractionModel(parsed.interaction_model),
+        structureConfidence: Number.isFinite(Number(parsed.structure_confidence)) ? Number(parsed.structure_confidence) : 0,
+        hasConcreteProducts: parseModelBoolean(parsed.has_concrete_products),
+        concreteProductCandidates: normalizeConcreteProductCandidates(parsed.concrete_product_candidates),
         keptPages,
         variantComparison,
         orderedPages
       }
       appState.aiRerankDocumentId = documentRecord.id
       appState.aiRerankCacheByDocumentId[documentRecord.id] = cloneAiRerankResult(appState.aiRerankResult)
+      updateStructureRoutingState(documentRecord)
       appState.summaryPanelOpen = false
 
       if (appState.aiRerankResult.bestPage) {
@@ -4797,6 +5323,7 @@
       showToast("AI rerank complete")
     } catch (error) {
       appState.aiRerankDocumentId = ""
+      updateStructureRoutingState(documentRecord)
       appState.aiRerankError = error instanceof Error ? error.message : "AI rerank failed."
       showToast("AI rerank failed")
       render()
@@ -4837,6 +5364,7 @@
 
       const selectedProductHint = normalizeText(selectionHints.selectedProductId || "")
       const selectedVariantHint = normalizeText(selectionHints.selectedVariantId || "")
+      const fromProductFirst = selectionHints.fromProductFirst === true
       const candidatePages = getDecisionCandidatePages(documentRecord, selectedPage, selectionHints)
       if (!candidatePages.length) {
         throw new Error("No candidate pages were found for spec analysis.")
@@ -5066,12 +5594,28 @@
         .filter(Boolean)
       const variantCandidates = shouldTreatVariantCandidatesAsConfiguration(rawVariantCandidates, includedPageRecords)
         ? []
-        : rawVariantCandidates
+        : (
+          fromProductFirst && parsingModeConfig.mode === "family"
+            ? suppressProductFirstSiblingVariants(rawVariantCandidates, selectedProductHint, appState.structureRouting?.productCandidates || [])
+            : rawVariantCandidates
+        )
       const supplementalCharacteristics = buildSupplementalCharacteristics(documentRecord, includedPageRecords, characteristics)
       const referenceInfo = Array.isArray(parsed.reference_info) ? parsed.reference_info : []
-      const mergedCharacteristics = sortCharacteristicsForDisplay(
-        filterCharacteristicsForSelectedVariant(
-          enrichCharacteristicsFromSectionPages(
+      const productScopedCharacteristics = fromProductFirst && selectedProductHint
+        ? filterCharacteristicsForSelectedRecord(
+            enrichCharacteristicsFromSectionPages(
+              mergeReferenceTextileIntoDimensions(
+                removeTextileRequirementOptionsFromUpholstery(
+                  mergeComColIntoDimensions([...characteristics, ...supplementalCharacteristics])
+                ),
+                referenceInfo
+              ),
+              includedPageRecords
+            ),
+            appState.structureRouting?.productCandidates || [],
+            selectedProductHint
+          )
+        : enrichCharacteristicsFromSectionPages(
             mergeReferenceTextileIntoDimensions(
               removeTextileRequirementOptionsFromUpholstery(
                 mergeComColIntoDimensions([...characteristics, ...supplementalCharacteristics])
@@ -5079,7 +5623,10 @@
               referenceInfo
             ),
             includedPageRecords
-          ),
+          )
+      const mergedCharacteristics = sortCharacteristicsForDisplay(
+        filterCharacteristicsForSelectedVariant(
+          productScopedCharacteristics,
           variantCandidates,
           selectedVariantHint || parsed.selected_variant_id || ""
         )
@@ -5101,6 +5648,7 @@
       appState.decisionAssistResult = {
         pageNumber: selectedPage.pageNumber,
         parsingMode: parsingModeConfig.mode,
+        fromProductFirst,
         pageRangeLabel,
         includedPages,
         productName: resolvedProductName,
